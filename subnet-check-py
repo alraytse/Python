@@ -1,0 +1,746 @@
+#!/usr/bin/env python3
+
+import paramiko
+import getpass
+import ipaddress
+import time
+import select
+import sys
+from datetime import datetime
+
+#############################################################################
+# USER INPUT WITH TIMEOUT
+#############################################################################
+
+def input_with_timeout(prompt, timeout=15, default="n"):
+
+    print(
+        f"{prompt} (default={default} in {timeout}s): ",
+        end="",
+        flush=True
+    )
+
+    ready, _, _ = select.select(
+        [sys.stdin],
+        [],
+        [],
+        timeout
+    )
+
+    if ready:
+        value = sys.stdin.readline().strip()
+        return value if value else default
+
+    print(f"\nNo input received. Using default '{default}'")
+    return default
+
+
+#############################################################################
+# SSH FUNCTIONS
+#############################################################################
+
+def connect_router(router, username, password):
+
+    try:
+
+        ssh = paramiko.SSHClient()
+
+        ssh.set_missing_host_key_policy(
+            paramiko.AutoAddPolicy()
+        )
+
+        ssh.connect(
+            hostname=router,
+            username=username,
+            password=password,
+            look_for_keys=False,
+            timeout=20,
+            banner_timeout=30,
+            auth_timeout=30
+        )
+
+        return ssh
+
+    except Exception as e:
+
+        print(
+            f"Failed connecting to {router}: {e}"
+        )
+
+        return None
+
+
+def run_command(shell, command, wait=3):
+
+    if shell.closed:
+        raise RuntimeError(
+            "SSH Channel Closed"
+        )
+
+    while shell.recv_ready():
+        shell.recv(65535)
+
+    shell.send(command + "\n")
+
+    time.sleep(wait)
+
+    output = ""
+
+    end_time = time.time() + 10
+
+    while time.time() < end_time:
+
+        while shell.recv_ready():
+
+            output += shell.recv(
+                65535
+            ).decode(
+                errors="ignore"
+            )
+
+        time.sleep(0.25)
+
+    return output
+
+
+#############################################################################
+# COMMAND BUILDER
+#############################################################################
+
+def build_commands(subnet, vrf_name=None):
+
+    network = ipaddress.ip_network(
+        subnet,
+        strict=False
+    )
+
+    first_ip = str(
+        network.network_address + 1
+    )
+
+    octets = str(
+        network.network_address
+    ).split(".")
+
+    summary_network = (
+        f"{octets[0]}.{octets[1]}.0.0"
+    )
+
+    commands = [
+
+        (
+            "LONGER_PREFIX",
+            f"show ip route vrf * "
+            f"{summary_network} "
+            f"255.255.0.0 longer-prefixes"
+        ),
+
+        (
+            "ROUTE_ALL_VRF_IP",
+            f"show ip route vrf * "
+            f"{first_ip}"
+        ),
+
+        (
+            "ROUTE_ALL_VRF_SUBNET",
+            f"show ip route vrf * "
+            f"{network.network_address}"
+        )
+
+    ]
+
+    if vrf_name:
+
+        commands.extend([
+
+            (
+                "ROUTE_VRF",
+                f"show ip route vrf "
+                f"{vrf_name} {first_ip}"
+            ),
+
+            (
+                "CEF_VRF",
+                f"show ip cef vrf "
+                f"{vrf_name} {first_ip}"
+            )
+
+        ])
+
+    else:
+
+        commands.extend([
+
+            (
+                "ROUTE",
+                f"show ip route "
+                f"{first_ip}"
+            ),
+
+            (
+                "CEF",
+                f"show ip cef "
+                f"{first_ip}"
+            )
+
+        ])
+
+    commands.append(
+
+        (
+            "EASTWEST",
+            f"show ip route {first_ip}"
+        )
+
+    )
+
+    return commands
+
+
+#############################################################################
+# VALIDATION
+#############################################################################
+
+def analyze_vrf_route(output):
+
+    lower = output.lower()
+
+    if "% subnet not in table" in lower:
+        return True, "Subnet not found"
+
+    if "routing table:" in lower:
+        return False, "Subnet found in VRF"
+
+    if "routing entry for" in lower:
+        return False, "Route already exists"
+
+    return True, "No route found"
+
+
+def analyze_longer_prefix(output):
+
+    lower = output.lower()
+
+    if (
+        "routing entry for" in lower or
+        "known via" in lower
+    ):
+        return (
+            False,
+            "More-specific route exists"
+        )
+
+    return (
+        True,
+        "No longer-prefix routes found"
+    )
+
+
+#############################################################################
+# USON VALIDATION
+#############################################################################
+
+def validate_uson_allocation(subnet):
+
+    network = ipaddress.ip_network(
+        subnet,
+        strict=False
+    )
+
+    east = ipaddress.ip_network(
+        "10.188.0.0/15"
+    )
+
+    west_ranges = [
+
+        ipaddress.ip_network(
+            "10.190.0.0/16"
+        ),
+
+        ipaddress.ip_network(
+            "10.191.0.0/17"
+        ),
+
+        ipaddress.ip_network(
+            "10.191.192.0/18"
+        )
+
+    ]
+
+    if network.subnet_of(east):
+        return "USON-EAST"
+
+    for west in west_ranges:
+
+        if network.subnet_of(west):
+            return "USON-WEST"
+
+    return "OUTSIDE-USON"
+
+
+#############################################################################
+# REGION DETECTION
+#############################################################################
+
+def determine_region(output):
+
+    if (
+        "10.254.128.1" in output or
+        "10.254.128.2" in output
+    ):
+        return (
+            "EAST",
+            "RSW Next-Hop Detected"
+        )
+
+    if (
+        "10.255.132." in output or
+        "10.255.133." in output or
+        "10.255.134." in output
+    ):
+        return (
+            "WEST",
+            "ISP Next-Hop Detected"
+        )
+
+    return (
+        "UNKNOWN",
+        "Unable to Determine"
+    )
+
+
+#############################################################################
+# PING FUNCTIONS
+#############################################################################
+
+def ping_ip(shell, ip, vrf_name=None):
+
+    if vrf_name:
+
+        cmd = (
+            f"ping vrf {vrf_name} "
+            f"{ip} repeat 1 timeout 1"
+        )
+
+    else:
+
+        cmd = (
+            f"ping {ip} repeat 1 timeout 1"
+        )
+
+    output = run_command(
+        shell,
+        cmd,
+        wait=2
+    )
+
+    return (
+        "Success rate is 100 percent"
+        in output
+    )
+
+
+def ping_sweep(shell, subnet, vrf_name=None):
+
+    network = ipaddress.ip_network(
+        subnet,
+        strict=False
+    )
+
+    active_hosts = []
+
+    hosts = list(
+        network.hosts()
+    )
+
+    if len(hosts) > 50:
+
+        print(
+            f"Subnet contains {len(hosts)} hosts. "
+            f"Checking first 50 only."
+        )
+
+        hosts = hosts[:50]
+
+    for host in hosts:
+
+        ip = str(host)
+
+        print(
+            f"Pinging {ip}"
+        )
+
+        if ping_ip(
+            shell,
+            ip,
+            vrf_name
+        ):
+            active_hosts.append(ip)
+
+    return active_hosts
+
+
+#############################################################################
+# MAIN
+#############################################################################
+
+def main():
+
+    print("\nSubnet Validation Tool\n")
+
+    routers_input = input(
+        "Routers (comma separated): "
+    ).strip()
+
+    subnet = input(
+        "Subnet (CIDR): "
+    ).strip()
+
+    vrf_name = input(
+        "VRF (blank for global): "
+    ).strip()
+
+    if not vrf_name:
+        vrf_name = None
+
+    username = input(
+        "Username: "
+    ).strip()
+
+    password = getpass.getpass(
+        "Password: "
+    )
+
+    run_ping = input_with_timeout(
+        "Run Ping Sweep? (y/n)",
+        timeout=15,
+        default="n"
+    ).lower()
+
+    routers = [
+        r.strip()
+        for r in routers_input.split(",")
+        if r.strip()
+    ]
+
+    commands = build_commands(
+        subnet,
+        vrf_name
+    )
+
+    report = []
+    executed_commands = []
+
+    overall_pass = True
+    active_hosts = []
+
+    report.append(
+        "Subnet Validation Report"
+    )
+
+    report.append(
+        f"Generated: {datetime.now()}"
+    )
+
+    report.append(
+        "=" * 80
+    )
+
+    allocation = validate_uson_allocation(
+        subnet
+    )
+
+    router_results = []
+
+    for router in routers:
+
+        print(
+            f"\nConnecting to {router}"
+        )
+
+        ssh = connect_router(
+            router,
+            username,
+            password
+        )
+
+        if not ssh:
+            overall_pass = False
+            continue
+
+        try:
+
+            shell = ssh.invoke_shell()
+
+            time.sleep(2)
+
+            run_command(
+                shell,
+                "terminal length 0"
+            )
+
+            results = {}
+
+            report.append(
+                f"\n{'=' * 80}"
+            )
+
+            report.append(
+                f"ROUTER: {router}"
+            )
+
+            report.append(
+                f"{'=' * 80}"
+            )
+
+            for cmd_type, cmd in commands:
+
+                print(
+                    f"Running: {cmd}"
+                )
+
+                executed_commands.append(
+                    f"{router}: {cmd}"
+                )
+
+                output = run_command(
+                    shell,
+                    cmd
+                )
+
+                results[
+                    cmd_type
+                ] = output
+
+                report.append(
+                    f"\nCOMMAND: {cmd}"
+                )
+
+                report.append(
+                    output
+                )
+
+            available, reason = (
+                analyze_vrf_route(
+                    results.get(
+                        "ROUTE_ALL_VRF_IP",
+                        ""
+                    )
+                )
+            )
+
+            lp_ok, lp_reason = (
+                analyze_longer_prefix(
+                    results.get(
+                        "LONGER_PREFIX",
+                        ""
+                    )
+                )
+            )
+
+            if not lp_ok:
+
+                available = False
+                reason = lp_reason
+
+            region, region_reason = (
+                determine_region(
+                    results.get(
+                        "EASTWEST",
+                        ""
+                    )
+                )
+            )
+
+            if not available:
+                overall_pass = False
+
+            router_results.append(
+                {
+                    "router": router,
+                    "available": available,
+                    "region": region,
+                    "reason": reason
+                }
+            )
+
+            report.append(
+                f"\nUSON Allocation: {allocation}"
+            )
+
+            report.append(
+                f"Availability: "
+                f"{'PASS' if available else 'FAIL'}"
+            )
+
+            report.append(
+                f"Reason: {reason}"
+            )
+
+            report.append(
+                f"Region: {region}"
+            )
+
+            report.append(
+                f"Detail: {region_reason}"
+            )
+
+        finally:
+
+            ssh.close()
+
+    #####################################################################
+    # PING SWEEP
+    #####################################################################
+
+    if run_ping == "y" and routers:
+
+        print(
+            "\nStarting Ping Sweep..."
+        )
+
+        ssh = connect_router(
+            routers[0],
+            username,
+            password
+        )
+
+        if ssh:
+
+            try:
+
+                shell = ssh.invoke_shell()
+
+                time.sleep(2)
+
+                run_command(
+                    shell,
+                    "terminal length 0"
+                )
+
+                active_hosts = ping_sweep(
+                    shell,
+                    subnet,
+                    vrf_name
+                )
+
+                if active_hosts:
+
+                    overall_pass = False
+
+                    report.append(
+                        "\nACTIVE HOSTS DETECTED"
+                    )
+
+                    for host in active_hosts:
+                        report.append(host)
+
+            finally:
+
+                ssh.close()
+
+    else:
+
+        report.append(
+            "\nPing Sweep Skipped"
+        )
+
+    #####################################################################
+    # SSH AUDIT
+    #####################################################################
+
+    report.append(
+        "\nSSH COMMAND AUDIT"
+    )
+
+    report.append(
+        "=" * 80
+    )
+
+    for cmd in executed_commands:
+        report.append(cmd)
+
+    #####################################################################
+    # SUMMARY
+    #####################################################################
+
+    report.append(
+        "\nFINAL SUMMARY"
+    )
+
+    report.append(
+        "=" * 80
+    )
+
+    report.append(
+        f"Subnet: {subnet}"
+    )
+
+    report.append(
+        f"VRF: {vrf_name or 'GLOBAL'}"
+    )
+
+    report.append(
+        f"USON Allocation: {allocation}"
+    )
+
+    report.append(
+        f"Routers Checked: {len(routers)}"
+    )
+
+    report.append(
+        f"Ping Sweep: "
+        f"{'RUN' if run_ping == 'y' else 'SKIPPED'}"
+    )
+
+    report.append(
+        f"Active Hosts Found: {len(active_hosts)}"
+    )
+
+    report.append(
+        "\nROUTER RESULTS"
+    )
+
+    for item in router_results:
+
+        report.append(
+            f"{item['router']} | "
+            f"{item['region']} | "
+            f"{'AVAILABLE' if item['available'] else 'IN USE'} | "
+            f"{item['reason']}"
+        )
+
+    report.append(
+        f"\nOVERALL RESULT: "
+        f"{'PASS' if overall_pass else 'FAIL'}"
+    )
+
+    report_file = (
+        "Subnet_Report_"
+        + datetime.now().strftime(
+            "%Y%m%d_%H%M%S"
+        )
+        + ".txt"
+    )
+
+    with open(
+        report_file,
+        "w"
+    ) as f:
+
+        f.write(
+            "\n".join(report)
+        )
+
+    print(
+        f"\nReport saved: {report_file}"
+    )
+
+    print(
+        f"Final Result: "
+        f"{'PASS' if overall_pass else 'FAIL'}"
+    )
+
+
+if __name__ == "__main__":
+    main()
