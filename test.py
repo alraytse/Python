@@ -1,152 +1,178 @@
-import re
-import subprocess
-import time
-from datetime import datetime
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-import paramiko
-import difflib
+#!/usr/bin/env python3
+
+import csv
 import getpass
+import re
+from netmiko import ConnectHandler
 
-# Extract IPs from files
-def extract_ips_from_file(filename):
-    ipv4_pattern = re.compile(r'\b(?:\d{1,3}\.){3}\d{1,3}\b')
-    ipv6_pattern = re.compile(r'\b(?:[A-Fa-f0-9]{1,4}:){1,7}[A-Fa-f0-9]{1,4}\b')
-    ips = []
+CSV_FILE = "stp_root_report.csv"
+
+
+def parse_vlans(output):
+    vlans = []
+
+    for line in output.splitlines():
+        match = re.match(r"^(\d+)\s+(\S+)", line.strip())
+
+        if match:
+            vlans.append({
+                "vlan": match.group(1),
+                "name": match.group(2)
+            })
+
+    return vlans
+
+
+def check_root(connection, vlan):
     try:
-        with open(filename.strip(), 'r') as file:
-            for line in file:
-                ips.extend(ipv4_pattern.findall(line))
-                ips.extend(ipv6_pattern.findall(line))
-    except FileNotFoundError:
-        print(f"File not found: {filename}")
-    return ips
+        output = connection.send_command(
+            f"show spanning-tree vlan {vlan}",
+            read_timeout=30
+        )
 
-# Ping IP with retries
-def ping_ip(ip, retries=3):
-    for attempt in range(1, retries + 1):
-        try:
-            ping_cmd = ['ping', '-c', '10', ip] if ':' not in ip else ['ping6', '-c', '10', ip]
-            result = subprocess.run(ping_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=15)
-            if result.returncode == 0:
-                return ip, "Success", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            else:
-                time.sleep(1)
-        except Exception as e:
-            return ip, f"Error: {str(e)}", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    return ip, "Failure", datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-# SSH and capture output
-def ssh_and_capture_output(hostname, eid, password, filename):
-    commands = [
-        "term len 0",
-        "sh ip bgp ipv4 unicast summary vrf all",
-        "sh ip bgp neighbors vrf all | count",
-        "sh ip bgp vrf all all | count",
-        "sh ip arp vrf all | count",
-        "sh ip arp vrf all",
-        "sh ip eigrp neighbors",
-        "sh ip route eigrp",
-        "sh mac address-table",
-        "sh running"
-    ]
-
-    output_lines = []
-
-    try:
-        client = paramiko.SSHClient()
-        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-        client.connect(hostname, username=eid, password=password, look_for_keys=False)
-
-        for cmd in commands:
-            stdin, stdout, stderr = client.exec_command(cmd)
-            output = stdout.read().decode()
-            output_lines.append(f"\n=== {cmd} ===\n{output.strip()}")
-
-        with open(filename, "w") as f:
-            f.write('\n'.join(output_lines))
-
-        return f"✅ Output written to {filename} for {hostname}"
+        return "This bridge is the root" in output
 
     except Exception as e:
-        return f"❌ SSH connection to {hostname} failed: {e}"
-    finally:
-        client.close()
+        print(f"Error checking VLAN {vlan}: {e}")
+        return False
 
-# Compare before/after files
-def compare_files(file1, file2, output_file):
-    try:
-        with open(file1, 'r') as f1, open(file2, 'r') as f2:
-            diff = difflib.unified_diff(
-                f1.readlines(),
-                f2.readlines(),
-                fromfile=file1,
-                tofile=file2
-            )
-            diff_output = ''.join(diff)
-            if diff_output:
-                with open(output_file, 'w') as outf:
-                    outf.write(diff_output)
-                print(f"📄 Differences for {file1} vs {file2} written to: {output_file}")
-            else:
-                print(f"✅ No differences between {file1} and {file2}")
-    except FileNotFoundError:
-        print(f"❌ Missing file(s): {file1} or {file2}")
 
-# Run SSH in parallel
-def run_ssh_parallel(hostnames, eid, password, first_run):
+def get_hostname(connection):
+    prompt = connection.find_prompt()
+    return prompt.replace("#", "").replace(">", "").strip()
+
+
+def process_switch(device):
+
     results = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = {}
-        for hostname in hostnames:
-            filename = f"{hostname}.before" if first_run == 'y' else f"{hostname}.after"
-            futures[executor.submit(ssh_and_capture_output, hostname, eid, password, filename)] = hostname
 
-        for future in as_completed(futures):
-            result = future.result()
-            print(result)
-            results.append(result)
+    try:
+        print(f"\nConnecting to {device['host']}...")
+
+        conn = ConnectHandler(**device)
+
+        hostname = get_hostname(conn)
+
+        vlan_output = conn.send_command(
+            "show vlan brief",
+            read_timeout=30
+        )
+
+        vlans = parse_vlans(vlan_output)
+
+        print(f"{hostname}: Found {len(vlans)} VLANs")
+
+        for vlan_info in vlans:
+
+            vlan_id = vlan_info["vlan"]
+            vlan_name = vlan_info["name"]
+
+            if check_root(conn, vlan_id):
+
+                results.append({
+                    "Device": hostname,
+                    "VLAN": vlan_id,
+                    "VLAN_Name": vlan_name,
+                    "Root_Bridge": "YES"
+                })
+
+        conn.disconnect()
+
+    except Exception as e:
+        print(f"Failed to connect to {device['host']} : {e}")
 
     return results
 
-# Main function
+
+def display_results(results):
+
+    print("\n" + "=" * 80)
+    print("SPANNING TREE ROOT VLAN REPORT")
+    print("=" * 80)
+
+    current_device = ""
+
+    for row in results:
+
+        if row["Device"] != current_device:
+            current_device = row["Device"]
+            print(f"\nSwitch: {current_device}")
+
+        print(
+            f" VLAN {row['VLAN']:>4}   "
+            f"Name: {row['VLAN_Name']}"
+        )
+
+
+def write_csv(results):
+
+    fields = [
+        "Device",
+        "VLAN",
+        "VLAN_Name",
+        "Root_Bridge"
+    ]
+
+    with open(CSV_FILE, "w", newline="") as csvfile:
+
+        writer = csv.DictWriter(
+            csvfile,
+            fieldnames=fields
+        )
+
+        writer.writeheader()
+
+        for row in results:
+            writer.writerow(row)
+
+
 def main():
-    # IP pinging section
-    file_input = input("Enter file names to extract IPs (comma-separated): ")
-    file_list = file_input.split(',')
 
-    all_ips = []
-    for file_name in file_list:
-        all_ips.extend(extract_ips_from_file(file_name))
+    hosts = input(
+        "\nEnter switch hostnames/IPs (comma delimited): "
+    ).strip()
 
-    all_ips = list(set(all_ips))  # Remove duplicates
-    print(f"🔍 Starting parallel ping for {len(all_ips)} IPs...")
+    host_list = [
+        host.strip()
+        for host in hosts.split(",")
+        if host.strip()
+    ]
 
-    with ThreadPoolExecutor(max_workers=10) as executor:
-        futures = [executor.submit(ping_ip, ip) for ip in all_ips]
-        with open('ip.csv', 'w') as output_file:
-            output_file.write("Timestamp,IP Address,Status\n")
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Pinging IPs"):
-                ip, status, timestamp = future.result()
-                output_file.write(f"{timestamp},{ip},{status}\n")
+    if not host_list:
+        print("No hosts entered.")
+        return
 
-    print(f"✅ Ping results saved to ip.csv.")
+    username = input("Username: ")
+    password = getpass.getpass("Password: ")
 
-    # SSH and comparison section
-    raw_input = input("Enter hostnames (comma-separated): ")
-    hostnames = [h.strip() for h in raw_input.split(',') if h.strip()]
-    eid = input("Enter your EID (username): ").strip()
-    password = getpass.getpass("Enter your password: ").strip()
-    first_run = input("Is this the first run? (y/n): ").strip().lower()
+    all_results = []
 
-    run_ssh_parallel(hostnames, eid, password, first_run)
+    for host in host_list:
 
-    if first_run != 'y':
-        for hostname in hostnames:
-            before_file = f"{hostname}.before"
-            after_file = f"{hostname}.after"
-            compare_file = f"{hostname}.compare"
-            compare_files(before_file, after_file, compare_file)
+        device = {
+            "device_type": "cisco_nxos",
+            "host": host,
+            "username": username,
+            "password": password,
+            "fast_cli": False
+        }
+
+        results = process_switch(device)
+        all_results.extend(results)
+
+    all_results.sort(
+        key=lambda x: (
+            x["Device"],
+            int(x["VLAN"])
+        )
+    )
+
+    display_results(all_results)
+
+    write_csv(all_results)
+
+    print(f"\nCSV report saved to: {CSV_FILE}")
+
 
 if __name__ == "__main__":
     main()
