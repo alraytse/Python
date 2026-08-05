@@ -34,7 +34,9 @@ def run_command(host, command):
         allow_agent=False
     )
 
-    stdin, stdout, stderr = ssh.exec_command(command)
+    stdin, stdout, stderr = ssh.exec_command(
+        command
+    )
 
     output = stdout.read().decode(
         "utf-8",
@@ -46,7 +48,7 @@ def run_command(host, command):
     return output
 
 # =========================================================
-# DEVICE TYPE
+# DEVICE TYPE DETECTION
 # =========================================================
 
 def get_device_type(host):
@@ -65,15 +67,7 @@ def get_device_type(host):
     return "IOS"
 
 # =========================================================
-# IPAM LOOKUP PLACEHOLDER
-# =========================================================
-
-def get_ipam_description(subnet):
-
-    return "IPAM Lookup Not Configured"
-
-# =========================================================
-# ARP UTILIZATION
+# ARP FUNCTIONS
 # =========================================================
 
 def get_subnet_arp_count(
@@ -137,7 +131,7 @@ def get_utilization(
         return 0
 
 # =========================================================
-# INTERFACES
+# INTERFACE PARSING
 # =========================================================
 
 def parse_interfaces(config):
@@ -152,9 +146,7 @@ def parse_interfaces(config):
 
     for intf, block in blocks:
 
-        desc = ""
-        ipaddr = ""
-        mask = ""
+        description = ""
 
         desc_match = re.search(
             r'description\s+(.+)',
@@ -162,23 +154,11 @@ def parse_interfaces(config):
         )
 
         if desc_match:
-            desc = desc_match.group(1).strip()
-
-        ip_match = re.search(
-            r'ip address\s+(\S+)\s+(\S+)',
-            block
-        )
-
-        if ip_match:
-
-            ipaddr = ip_match.group(1)
-            mask = ip_match.group(2)
+            description = desc_match.group(1).strip()
 
         interfaces.append({
             "interface": intf,
-            "description": desc,
-            "ip": ipaddr,
-            "mask": mask
+            "description": description
         })
 
     return interfaces
@@ -244,7 +224,7 @@ def get_vlan_info(
     return vlan_id, vlan_name
 
 # =========================================================
-# NEIGHBOR PARSING
+# LLDP / CDP PARSING
 # =========================================================
 
 def parse_neighbors(output):
@@ -283,55 +263,63 @@ def get_route_info(host, subnet):
 
     route_type = "Unknown"
 
-    if "ospf" in output.lower():
+    output_lower = output.lower()
+
+    if "ospf" in output_lower:
         route_type = "OSPF"
-    elif "bgp" in output.lower():
+
+    elif "bgp" in output_lower:
         route_type = "BGP"
-    elif "eigrp" in output.lower():
+
+    elif "eigrp" in output_lower:
         route_type = "EIGRP"
-    elif "static" in output.lower():
+
+    elif "isis" in output_lower:
+        route_type = "ISIS"
+
+    elif "static" in output_lower:
         route_type = "Static"
 
-    connected = re.search(
+    connected_match = re.search(
         r'directly connected,\s*(\S+)',
         output,
         re.I
     )
 
-    if connected:
+    if connected_match:
 
         return {
             "route_type": "Connected",
-            "interface": connected.group(1),
+            "interface": connected_match.group(1),
             "next_hop": ""
         }
 
-    routed = re.search(
+    vlan_route_match = re.search(
         r'via\s+(\d+\.\d+\.\d+\.\d+).*?(Vlan\d+)',
         output,
         re.I | re.S
     )
 
-    if routed:
+    if vlan_route_match:
 
         return {
             "route_type": route_type,
-            "interface": routed.group(2),
-            "next_hop": routed.group(1)
+            "interface": vlan_route_match.group(2),
+            "next_hop": vlan_route_match.group(1)
         }
 
-    generic = re.search(
+    generic_route_match = re.search(
         r'via\s+(\d+\.\d+\.\d+\.\d+)',
         output,
         re.I
     )
 
-    if generic:
+    if generic_route_match:
 
         return {
             "route_type": route_type,
             "interface": "",
-            "next_hop": generic.group(1)
+            "next_hop": generic_route_match.group(1)
         }
 
     return {
@@ -341,7 +329,7 @@ def get_route_info(host, subnet):
     }
 
 # =========================================================
-# USAGE
+# USAGE DESCRIPTION
 # =========================================================
 
 def determine_usage(
@@ -388,6 +376,8 @@ def process_device(host, subnets):
 
     results = []
 
+    host = host.strip()
+
     try:
 
         print("\n" + "=" * 80)
@@ -405,12 +395,16 @@ def process_device(host, subnets):
         if device_type == "NXOS":
             arp_cmd = "show ip arp vrf all"
 
+        print("Collecting ARP table...")
+
         arp_output = run_command(
             host,
             arp_cmd
         )
 
         try:
+
+            print("Collecting LLDP neighbors...")
 
             neighbor_output = run_command(
                 host,
@@ -419,10 +413,18 @@ def process_device(host, subnets):
 
         except:
 
+            print(
+                "LLDP unavailable, trying CDP..."
+            )
+
             neighbor_output = run_command(
                 host,
                 "show cdp neighbors"
             )
+
+        print(
+            "Collecting running configuration..."
+        )
 
         running_config = run_command(
             host,
@@ -441,10 +443,19 @@ def process_device(host, subnets):
             neighbor_output
         )
 
+        print(
+            f"Interfaces Found : {len(interfaces)}"
+        )
+
+        print(
+            f"VLANs Found      : {len(vlan_db)}"
+        )
+
         for subnet in subnets:
 
+            print("\n" + "-" * 80)
             print(
-                f"\nChecking Subnet : {subnet}"
+                f"Checking Subnet  : {subnet}"
             )
 
             route_info = get_route_info(
@@ -479,25 +490,38 @@ def process_device(host, subnets):
             )
 
             print(
-                f"Route Type       : {route_info['route_type']}"
+                f"Route Type       : "
+                f"{route_info['route_type']}"
             )
 
             if route_info["interface"]:
+
                 print(
-                    f"Interface        : {route_info['interface']}"
+                    f"Interface        : "
+                    f"{route_info['interface']}"
                 )
 
             if route_info["next_hop"]:
+
                 print(
-                    f"Next Hop         : {route_info['next_hop']}"
+                    f"Next Hop         : "
+                    f"{route_info['next_hop']}"
                 )
 
             if vlan_id:
+
                 print(
                     f"VLAN ID          : {vlan_id}"
                 )
+
                 print(
                     f"VLAN Name        : {vlan_name}"
+                )
+
+            if neighbor:
+
+                print(
+                    f"Neighbor Device  : {neighbor}"
                 )
 
             print(
@@ -505,7 +529,8 @@ def process_device(host, subnets):
             )
 
             print(
-                f"Utilization %    : {utilization}"
+                f"ARP Utilization  : "
+                f"{utilization}%"
             )
 
             results.append([
@@ -517,7 +542,6 @@ def process_device(host, subnets):
                 route_info["interface"],
                 vlan_id,
                 vlan_name,
-                get_ipam_description(subnet),
                 usage,
                 neighbor,
                 arp_count,
@@ -593,14 +617,17 @@ def main():
     results = []
 
     with ThreadPoolExecutor(
-            max_workers=20) as executor:
+        max_workers=20
+    ) as executor:
 
         futures = [
+
             executor.submit(
                 process_device,
                 host.strip(),
                 subnets
             )
+
             for host in hosts
         ]
 
@@ -610,13 +637,23 @@ def main():
                 future.result()
             )
 
+    print("\n" + "=" * 80)
+    print("PROCESSING SUMMARY")
+    print("=" * 80)
+    print(
+        f"Total Records Generated: "
+        f"{len(results)}"
+    )
+
     with open(
             "subnet_report.csv",
             "w",
             newline=""
     ) as csvfile:
 
-        writer = csv.writer(csvfile)
+        writer = csv.writer(
+            csvfile
+        )
 
         writer.writerow([
             "IP Subnet",
@@ -626,7 +663,6 @@ def main():
             "Interface",
             "VLAN ID",
             "VLAN Name",
-            "IPAM Description",
             "Usage in Plain Language",
             "Other Devices Connected",
             "# ARPs",
@@ -641,7 +677,9 @@ def main():
             newline=""
     ) as csvfile:
 
-        writer = csv.writer(csvfile)
+        writer = csv.writer(
+            csvfile
+        )
 
         writer.writerow([
             "Device",
@@ -652,8 +690,9 @@ def main():
             COMMAND_LOG
         )
 
-    print("\nReport written to subnet_report.csv")
-    print("Command audit written to command_audit.csv")
+    print("\nGenerated Files:")
+    print("  subnet_report.csv")
+    print("  command_audit.csv")
 
 
 if __name__ == "__main__":
