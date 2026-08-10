@@ -65,20 +65,35 @@ def configure_terminal(conn, host, device_type):
         logging.warning("%s: unable to disable terminal paging", host, exc_info=True)
 
 
-def build_route_command(subnet, device_type):
+def normalize_vrf(value):
+    value = value.strip()
+    if not value or value.lower() in {"global", "default", "none"}:
+        return None
+    return value
+
+
+def build_route_command(subnet, device_type, vrf=None):
     target = ipaddress.ip_network(subnet, strict=False).network_address
+    if vrf:
+        return f"show ip route vrf {vrf} {target}"
     return f"show ip route {target}"
 
 
-def build_arp_command(device_type):
+def build_arp_command(device_type, vrf=None):
+    if vrf:
+        return f"show ip arp vrf {vrf}"
     return "show ip arp"
 
 
-def build_ping_command(target, device_type):
+def build_ping_command(target, device_type, vrf=None):
     if device_type == "cisco_nxos":
-        return f"ping {target} count 5 timeout 1"
+        command = f"ping {target} count 5 timeout 1"
+        if vrf:
+            command += f" vrf {vrf}"
+        return command
 
-    return f"ping {target} repeat 5 timeout 1"
+    prefix = f"ping vrf {vrf} " if vrf else "ping "
+    return f"{prefix}{target} repeat 5 timeout 1"
 
 
 def parse_ping_output(output):
@@ -267,12 +282,17 @@ def choose_ping_target(arp_output, subnet):
     return str(hosts[0]) if hosts else str(network.network_address)
 
 
-def process_device(host, username, password, device_type, subnets):
+def process_device(host, username, password, device_type, vrf, subnets):
     results = []
     conn = None
 
     try:
-        logging.info("%s: connecting with %s using the global routing table", host, device_type)
+        logging.info(
+            "%s: connecting with %s using VRF=%s",
+            host,
+            device_type,
+            vrf or "GLOBAL",
+        )
         conn = ConnectHandler(
             device_type=device_type,
             host=host,
@@ -285,10 +305,10 @@ def process_device(host, username, password, device_type, subnets):
         )
         configure_terminal(conn, host, device_type)
 
-        arp_output = send_command(conn, host, build_arp_command(device_type))
+        arp_output = send_command(conn, host, build_arp_command(device_type, vrf))
 
         for subnet in subnets:
-            route_command = build_route_command(subnet, device_type)
+            route_command = build_route_command(subnet, device_type, vrf)
             try:
                 route_output = send_command(conn, host, route_command)
                 route = parse_route_output(route_output)
@@ -325,7 +345,7 @@ def process_device(host, username, password, device_type, subnets):
                 reachability = "ARP_ONLY" if arp_count else "NO_ROUTE"
             else:
                 try:
-                    ping_command = build_ping_command(ping_target, device_type)
+                    ping_command = build_ping_command(ping_target, device_type, vrf)
                     ping_output = send_command(conn, host, ping_command, read_timeout=60)
                     sent, received, success_rate, reachability = parse_ping_output(ping_output)
                 except Exception as exc:
@@ -342,6 +362,7 @@ def process_device(host, username, password, device_type, subnets):
                 str(subnet),
                 host,
                 device_type,
+                vrf or "GLOBAL",
                 "YES" if route["route_present"] else "NO",
                 "YES" if route["null_route"] else "NO",
                 route["route_type"],
@@ -405,7 +426,7 @@ def build_subnets(start_text, end_text):
 
 
 def main():
-    logging.info("Global-table subnet audit started")
+    logging.info("VRF-aware subnet audit started")
 
     start_text = input("Starting subnet/mask: ").strip()
     end_text = input("Ending subnet/mask: ").strip()
@@ -413,6 +434,7 @@ def main():
     device_type = input(
         "Device type [cisco_ios/cisco_xe/cisco_nxos/arista_eos] (default cisco_ios): "
     ).strip() or "cisco_ios"
+    vrf = normalize_vrf(input("VRF (blank for global): "))
     username = input("Username: ").strip()
     password = getpass.getpass("Password: ")
 
@@ -425,14 +447,14 @@ def main():
 
     subnets = build_subnets(start_text, end_text)
     logging.info(
-        "Inputs: devices=%d subnets=%d device_type=%s",
-        len(hosts), len(subnets), device_type,
+        "Inputs: devices=%d subnets=%d device_type=%s vrf=%s",
+        len(hosts), len(subnets), device_type, vrf or "GLOBAL",
     )
 
     results = []
     with ThreadPoolExecutor(max_workers=min(5, len(hosts))) as pool:
         futures = [
-            pool.submit(process_device, host, username, password, device_type, subnets)
+            pool.submit(process_device, host, username, password, device_type, vrf, subnets)
             for host in hosts
         ]
         for future in as_completed(futures):
@@ -443,7 +465,7 @@ def main():
     with open(REPORT_FILE, "w", newline="", encoding="utf-8") as file_handle:
         writer = csv.writer(file_handle)
         writer.writerow([
-            "IP Subnet", "Device", "Device Type", "Route Present",
+            "IP Subnet", "Device", "Device Type", "VRF", "Route Present",
             "Null Route", "Route Type", "Interface", "VLAN ID", "VLAN Name", "Next Hop",
             "ARP Count", "ARP Utilization %", "Ping Target", "ICMP Sent",
             "ICMP Received", "ICMP Success %", "Reachability Status",
@@ -464,7 +486,11 @@ def main():
     logging.info("Report saved to %s", REPORT_FILE)
     logging.info("Audit saved to %s", AUDIT_FILE)
     logging.info("Failures saved to %s", FAILED_FILE)
-    logging.info("Global-table subnet audit completed: %d records, %d failed devices", len(results), len(FAILED_DEVICES))
+    logging.info(
+        "VRF-aware subnet audit completed: %d records, %d failed devices",
+        len(results),
+        len(FAILED_DEVICES),
+    )
 
 
 if __name__ == "__main__":
