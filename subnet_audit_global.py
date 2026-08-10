@@ -142,14 +142,24 @@ def parse_route_output(output):
     if any(marker in lower for marker in not_found_markers):
         return {
             "route_present": False,
+            "null_route": False,
             "route_type": "No Route",
             "interface": "",
             "next_hop": "",
         }
 
-    route_present = bool(
-        re.search(r"routing entry for|known via|is directly connected|via \d+\.\d+\.\d+\.\d+", lower)
-    )
+    null_route = bool(re.search(
+        r"\b(?:null\d*|discard|blackhole|reject)\b",
+        output,
+        re.IGNORECASE,
+    ))
+
+    route_present = bool(re.search(
+        r"routing entry for|known via|is directly connected|"
+        r"via\s+(?:\d+\.\d+\.\d+\.\d+|null\d*|discard|blackhole|reject)",
+        output,
+        re.IGNORECASE,
+    ))
 
     route_type = "Unknown"
     protocol_patterns = [
@@ -165,7 +175,11 @@ def parse_route_output(output):
             route_type = name
             break
 
-    next_hop_match = re.search(r"via\s+(\d+\.\d+\.\d+\.\d+)", output, re.I)
+    next_hop_match = re.search(
+        r"via\s+(\d+\.\d+\.\d+\.\d+)",
+        output,
+        re.IGNORECASE,
+    )
     next_hop = next_hop_match.group(1) if next_hop_match else ""
 
     interface = ""
@@ -182,15 +196,21 @@ def parse_route_output(output):
         r"(HundredGigE\S+)",
         r"(Ethernet\S+)",
         r"(Eth\S+)",
+        r"(Null\d*)",
+        r"(Discard|Blackhole|Reject)",
     ]
     for pattern in interface_patterns:
-        match = re.search(pattern, output, re.I)
+        match = re.search(pattern, output, re.IGNORECASE)
         if match:
             interface = match.group(1)
             break
 
+    if null_route:
+        route_type = "Null Route"
+
     return {
         "route_present": route_present,
+        "null_route": null_route,
         "route_type": route_type if route_present else "No Route",
         "interface": interface,
         "next_hop": next_hop,
@@ -279,6 +299,7 @@ def process_device(host, username, password, device_type, subnets):
                 route_output = ""
                 route = {
                     "route_present": False,
+                    "null_route": False,
                     "route_type": "Lookup Error",
                     "interface": "",
                     "next_hop": "",
@@ -297,6 +318,9 @@ def process_device(host, username, password, device_type, subnets):
 
             if collection_status == "ERROR":
                 reachability = "ROUTE_LOOKUP_ERROR"
+            elif route["null_route"]:
+                # A null/discard route intentionally drops traffic; do not ping its target.
+                reachability = "NULL_ROUTE"
             elif not route["route_present"]:
                 reachability = "ARP_ONLY" if arp_count else "NO_ROUTE"
             else:
@@ -319,6 +343,7 @@ def process_device(host, username, password, device_type, subnets):
                 host,
                 device_type,
                 "YES" if route["route_present"] else "NO",
+                "YES" if route["null_route"] else "NO",
                 route["route_type"],
                 route["interface"],
                 vlan_id,
@@ -419,7 +444,7 @@ def main():
         writer = csv.writer(file_handle)
         writer.writerow([
             "IP Subnet", "Device", "Device Type", "Route Present",
-            "Route Type", "Interface", "VLAN ID", "VLAN Name", "Next Hop",
+            "Null Route", "Route Type", "Interface", "VLAN ID", "VLAN Name", "Next Hop",
             "ARP Count", "ARP Utilization %", "Ping Target", "ICMP Sent",
             "ICMP Received", "ICMP Success %", "Reachability Status",
             "Collection Status", "Error",
