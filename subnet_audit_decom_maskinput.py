@@ -29,20 +29,6 @@ DEVICE_TYPES = [
 ]
 
 
-def mask_to_prefix(mask):
-    """Accept a dotted subnet mask or a CIDR prefix and return the prefix length."""
-    mask = mask.strip()
-    if mask.isdigit():
-        prefix = int(mask)
-        if not 0 <= prefix <= 32:
-            raise ValueError("Prefix length must be between 0 and 32")
-        return prefix
-    try:
-        return ipaddress.IPv4Network(f"0.0.0.0/{mask}").prefixlen
-    except Exception as exc:
-        raise ValueError(f"Invalid subnet mask: {mask}") from exc
-
-
 def detect_device_type(host, username, password):
     print(f"[{host}] Detecting platform...")
 
@@ -265,7 +251,10 @@ def process_device(host, username, password, subnets):
             vlan_id, vlan_name = get_vlan_info(route["interface"], vlan_db)
             arp_count = get_arp_count(arp_output, subnet)
             utilization = get_utilization(subnet, arp_count)
+
             network = ipaddress.ip_network(subnet, strict=False)
+            network_address = str(network.network_address)
+            prefix_length = network.prefixlen
             subnet_mask = str(network.netmask)
 
             if route["null_route"]:
@@ -278,9 +267,10 @@ def process_device(host, username, password, subnets):
                 )
 
             results.append([
-                str(network.network_address),
-                subnet_mask,
                 subnet,
+                network_address,
+                prefix_length,
+                subnet_mask,
                 host,
                 device_type,
                 "YES" if route["route_present"] else "NO",
@@ -313,6 +303,16 @@ def process_device(host, username, password, subnets):
     return results
 
 
+def parse_subnet(value, label):
+    """Parse a subnet entered in CIDR form (e.g. 10.190.0.0/24)."""
+    value = value.strip()
+    if "/" not in value:
+        raise ValueError(
+            f"{label} must be entered in CIDR form, e.g. 10.190.0.0/24"
+        )
+    return ipaddress.ip_network(value, strict=False)
+
+
 def main():
     start_time = datetime.now()
 
@@ -325,21 +325,24 @@ def main():
         print("No hosts provided. Exiting.")
         return
 
-    start = input("Starting subnet: ").strip()
-    end = input("Ending subnet: ").strip()
-    subnet_mask = input("Subnet Mask (e.g. 255.255.255.0): ").strip()
-    prefix = mask_to_prefix(subnet_mask)
+    start_net = parse_subnet(
+        input("Starting subnet/mask (e.g. 10.190.0.0/24): "),
+        "Starting subnet",
+    )
+    end_net = parse_subnet(
+        input("Ending subnet/mask (e.g. 10.190.5.0/24): "),
+        "Ending subnet",
+    )
+
     username = input("Username: ").strip()
     password = getpass.getpass("Password: ")
-
-    start_net = ipaddress.ip_network(f"{start}/{prefix}", strict=False)
-    end_net = ipaddress.ip_network(f"{end}/{prefix}", strict=False)
 
     if start_net.prefixlen != end_net.prefixlen:
         raise ValueError("Starting and ending subnets must use the same mask")
     if end_net.network_address < start_net.network_address:
         raise ValueError("Ending subnet must be greater than or equal to starting subnet")
 
+    prefix = start_net.prefixlen
     subnets = []
     current = start_net.network_address
     while current <= end_net.network_address:
@@ -351,8 +354,8 @@ def main():
     print("Subnet Audit Tool")
     print("=" * 60)
     print(f"Devices: {len(hosts)}")
-    print(f"Subnet Mask: {subnet_mask} (/{prefix})")
     print(f"Subnet Range: {start_net} -> {end_net}")
+    print(f"Mask: /{prefix} ({start_net.netmask})")
     print(f"Total Subnets: {len(subnets)}")
 
     results = []
@@ -364,14 +367,15 @@ def main():
         for future in futures:
             results.extend(future.result())
 
-    results.sort(key=lambda row: (row[3], row[2]))
+    results.sort(key=lambda row: (row[4], row[0]))
 
     with open(REPORT_FILE, "w", newline="", encoding="utf-8") as file_handle:
         writer = csv.writer(file_handle)
         writer.writerow([
-            "Network Address",
-            "Subnet Mask",
             "IP Subnet",
+            "Network Address",
+            "Prefix Length",
+            "Subnet Mask",
             "Device",
             "Device Type",
             "Route Present",
