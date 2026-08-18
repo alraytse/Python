@@ -1,908 +1,402 @@
 #!/usr/bin/env python3
 
-import csv
-import getpass
-import ipaddress
 import re
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
-from threading import Lock
-
+import csv
+import socket
+from getpass import getpass
 from netmiko import ConnectHandler
 
-TIMESTAMP = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_CSV = "inventory_report.csv"
 
-REPORT_FILE = f"subnet_report_{TIMESTAMP}.csv"
-AUDIT_FILE = f"command_audit_{TIMESTAMP}.csv"
-FAILED_FILE = f"failed_devices_{TIMESTAMP}.csv"
+VENDOR_KEYWORDS = {
+    "VERIZON": "Verizon",
+    "ATT": "AT&T",
+    "AT&T": "AT&T",
+    "LUMEN": "Lumen",
+    "CENTURYLINK": "CenturyLink",
+    "COGENT": "Cogent",
+    "COMCAST": "Comcast",
+    "CHARTER": "Charter",
+    "ZAYO": "Zayo",
+    "WINDSTREAM": "Windstream"
+}
 
-COMMAND_LOG = []
-FAILED_DEVICES = []
+TYPE_KEYWORDS = {
+    "FW": "Firewall",
+    "FIREWALL": "Firewall",
+    "ISP": "Internet",
+    "INTERNET": "Internet",
+    "MPLS": "MPLS",
+    "VPN": "VPN",
+    "WAN": "WAN"
+}
 
-COMMAND_LOCK = Lock()
-FAILED_LOCK = Lock()
 
-DEVICE_TYPES = [
-    "cisco_nxos",
-    "cisco_xe",
-    "cisco_ios",
-    "arista_eos",
-]
+def resolve_ip(hostname):
+    try:
+        return socket.gethostbyname(hostname)
+    except Exception:
+        return hostname
 
-MPLS_PREFIX_RE = re.compile(
-    r"\b(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})\b"
-)
 
-MPLS_INTERFACE_RE = re.compile(
-    r"\b(?:"
-    r"Vlan\d+|Loopback\d+|Port-channel\S+|Port-Channel\S+|Po\d+|"
-    r"GigabitEthernet\S+|TenGigabitEthernet\S+|"
-    r"TwentyFiveGigE\S+|FortyGigE\S+|HundredGigE\S+|"
-    r"TenGigE\S+|Ethernet\S+|Eth\S+"
-    r")\b",
-    re.IGNORECASE,
-)
+def detect_vendor(description):
 
-def detect_device_type(host, username, password):
-    print(f"[{host}] Detecting platform...")
+    upper = description.upper()
 
-    for device_type in DEVICE_TYPES:
-        conn = None
+    for keyword, vendor in VENDOR_KEYWORDS.items():
+        if keyword in upper:
+            return vendor
 
-        try:
-            conn = ConnectHandler(
-                device_type=device_type,
-                host=host,
-                username=username,
-                password=password,
-                fast_cli=False,
-                banner_timeout=60,
-                auth_timeout=60,
-                conn_timeout=30,
-            )
+    return "Unknown"
 
-            print(f"[{host}] Platform detected: {device_type}")
-            return device_type
 
-        except Exception:
+def detect_circuit_type(description):
+
+    upper = description.upper()
+
+    found = []
+
+    for keyword, circuit_type in TYPE_KEYWORDS.items():
+        if keyword in upper:
+            found.append(circuit_type)
+
+    if found:
+        return ",".join(sorted(set(found)))
+
+    return "Unknown"
+
+
+def matched_keywords(description):
+
+    upper = description.upper()
+
+    matches = []
+
+    for keyword in TYPE_KEYWORDS:
+        if keyword in upper:
+            matches.append(keyword)
+
+    for keyword in VENDOR_KEYWORDS:
+        if keyword in upper:
+            matches.append(keyword)
+
+    return ",".join(sorted(set(matches)))
+
+
+def find_attached_device(description):
+
+    devices = re.findall(
+        r'(DDC1-[A-Za-z0-9\-]+|USON-[A-Za-z0-9\-]+|BUMSH\d+)',
+        description,
+        re.IGNORECASE
+    )
+
+    if devices:
+        return devices[0]
+
+    return ""
+
+
+def build_notes(status, vendor, circuit_id=""):
+
+    notes = []
+
+    if status.lower() not in ["connected", "up"]:
+        notes.append("Interface Down")
+
+    if vendor == "Unknown":
+        notes.append("Vendor Unknown")
+
+    if not circuit_id:
+        notes.append("Circuit ID Missing")
+
+    return "; ".join(notes)
+
+
+def connect_device(host, username, password):
+
+    return ConnectHandler(
+        device_type="cisco_nxos",
+        host=host,
+        username=username,
+        password=password,
+        fast_cli=False
+    )
+
+
+def parse_interface_status(output):
+
+    interfaces = {}
+
+    lines = output.splitlines()
+
+    for line in lines:
+
+        line = line.rstrip()
+
+        if not line:
             continue
 
-        finally:
-            if conn:
-                try:
-                    conn.disconnect()
-                except Exception:
-                    pass
-
-    raise Exception("Unable to determine device type")
-
-def send_command(conn, host, command, read_timeout=120):
-    with COMMAND_LOCK:
-        COMMAND_LOG.append([
-            datetime.now().isoformat(timespec="seconds"),
-            host,
-            command,
-        ])
-
-    print(f"[{host}] Executing: {command}")
-    return conn.send_command(
-        command,
-        read_timeout=read_timeout,
-    )
-
-def build_vlan_db(output):
-    vlan_db = {}
-
-    for line in output.splitlines():
-        match = re.match(r"^\s*(\d+)\s+(\S+)", line)
-
-        if match:
-            vlan_db[f"Vlan{match.group(1)}"] = match.group(2)
-
-    return vlan_db
-
-def get_vlan_info(interface_name, vlan_db):
-    interface_name = interface_name or ""
-
-    match = re.search(
-        r"Vlan(\d+)",
-        interface_name,
-        re.IGNORECASE,
-    )
-
-    if not match:
-        match = re.search(r"\.(\d+)$", interface_name)
-
-    if not match:
-        return "", ""
-
-    vlan_id = match.group(1)
-
-    return vlan_id, vlan_db.get(f"Vlan{vlan_id}", "")
-
-def get_arp_count(arp_output, subnet):
-    network = ipaddress.ip_network(
-        subnet,
-        strict=False,
-    )
-
-    unique_ips = set()
-
-    for line in arp_output.splitlines():
-        match = re.search(
-            r"(\d+\.\d+\.\d+\.\d+)",
-            line,
-        )
-
-        if not match:
+        if line.startswith("--"):
             continue
 
-        try:
-            ip = ipaddress.ip_address(match.group(1))
-
-            if ip in network:
-                unique_ips.add(str(ip))
-
-        except ValueError:
+        if line.startswith("Port"):
             continue
 
-    return len(unique_ips)
-
-def get_utilization(subnet, arp_count):
-    network = ipaddress.ip_network(
-        subnet,
-        strict=False,
-    )
-
-    usable_hosts = max(
-        network.num_addresses - 2,
-        1,
-    )
-
-    return round(
-        (arp_count / usable_hosts) * 100,
-        2,
-    )
-
-def classify_decom_candidate(route_present, arp_count):
-    if not route_present and arp_count == 0:
-        return "YES", "No route and no ARP entries"
-
-    if not route_present and arp_count > 0:
-        return "REVIEW", "ARP entries found but route not detected"
-
-    return "NO", "Route present"
-
-def get_lookup_ip(network):
-    """
-    Return an address inside the subnet for route lookup.
-    """
-    if network.num_addresses == 1:
-        return network.network_address
-
-    return network.network_address + 1
-
-def get_matched_prefix(output, lookup_ip):
-    """
-    Return the most-specific route prefix containing lookup_ip.
-    """
-    candidates = set()
-
-    prefixes = re.findall(
-        r"\b(\d{1,3}(?:\.\d{1,3}){3}/\d{1,2})\b",
-        output,
-    )
-
-    for prefix_text in prefixes:
-        try:
-            prefix = ipaddress.ip_network(
-                prefix_text,
-                strict=False,
-            )
-
-            if lookup_ip in prefix:
-                candidates.add(prefix)
-
-        except ValueError:
+        if not re.match(r'^(Eth|Po|mgmt)', line):
             continue
 
-    if not candidates:
-        return None
+        #
+        # Nexus format:
+        #
+        # Eth1/25 DDC1-ISP-FW2 Eth1 notconnect 100 auto auto 1000baseT
+        #
 
-    return max(
-        candidates,
-        key=lambda network: network.prefixlen,
-    )
+        parts = re.split(r'\s{2,}', line.strip())
 
-def build_route_command(vrf, lookup_ip):
-    if vrf:
-        return f"show ip route vrf {vrf} {lookup_ip}"
-
-    return f"show ip route {lookup_ip}"
-
-def build_arp_command(device_type, vrf):
-    if device_type == "arista_eos":
-        if vrf:
-            return f"show arp vrf {vrf}"
-
-        return "show arp"
-
-    if vrf:
-        return f"show ip arp vrf {vrf}"
-
-    return "show ip arp"
-
-def build_mpls_command(device_type):
-    if device_type == "arista_eos":
-        return "show mpls lfib"
-
-    return "show mpls forwarding-table"
-
-def get_route_info(conn, host, subnet, vrf):
-    network = ipaddress.ip_network(
-        subnet,
-        strict=False,
-    )
-
-    lookup_ip = get_lookup_ip(network)
-
-    command = build_route_command(
-        vrf,
-        lookup_ip,
-    )
-
-    output = send_command(
-        conn,
-        host,
-        command,
-    )
-
-    lower = output.lower()
-
-    null_route = bool(
-        re.search(
-            r"\bnull0\b|\bdiscard\b|\bblackhole\b|\breject\b",
-            lower,
-        )
-    )
-
-    route_not_found = any(
-        marker in lower
-        for marker in [
-            "network not in table",
-            "subnet not in table",
-            "route not found",
-            "no route",
-            "% invalid",
-            "not found in routing table",
-            "not in routing table",
-        ]
-    )
-
-    matched_prefix = get_matched_prefix(
-        output,
-        lookup_ip,
-    )
-
-    route_present = (
-        not route_not_found
-        and matched_prefix is not None
-    )
-
-    exact_route = (
-        matched_prefix is not None
-        and matched_prefix == network
-    )
-
-    if null_route:
-        route_type = "Null Route"
-
-    elif not route_present:
-        route_type = "No Route"
-
-    else:
-        route_type = "Unknown"
-
-        protocol_map = [
-            (
-                r"is directly connected|directly connected|\bconnected\b",
-                "Connected",
-            ),
-            (r"\bbgp\b", "BGP"),
-            (r"\bospf\b", "OSPF"),
-            (r"\beigrp\b", "EIGRP"),
-            (r"\bisis\b", "ISIS"),
-            (r"\bstatic\b", "Static"),
-        ]
-
-        for pattern, protocol in protocol_map:
-            if re.search(
-                pattern,
-                output,
-                re.IGNORECASE,
-            ):
-                route_type = protocol
-                break
-
-    next_hop = ""
-
-    match = re.search(
-        r"via\s+(\d+\.\d+\.\d+\.\d+)",
-        output,
-        re.IGNORECASE,
-    )
-
-    if match:
-        next_hop = match.group(1)
-
-    interface = ""
-
-    interface_patterns = [
-        r"(Vlan\d+)",
-        r"(Loopback\d+)",
-        r"(Port-channel\S+)",
-        r"(Port-Channel\S+)",
-        r"(Po\d+)",
-        r"(GigabitEthernet\S+)",
-        r"(TenGigabitEthernet\S+)",
-        r"(TwentyFiveGigE\S+)",
-        r"(FortyGigE\S+)",
-        r"(HundredGigE\S+)",
-        r"(TenGigE\S+)",
-        r"(Ethernet\S+)",
-        r"(Eth\S+)",
-    ]
-
-    for pattern in interface_patterns:
-        match = re.search(
-            pattern,
-            output,
-            re.IGNORECASE,
-        )
-
-        if match:
-            interface = match.group(1)
-            break
-
-    return {
-        "route_present": route_present,
-        "exact_route": exact_route,
-        "matched_prefix": (
-            str(matched_prefix)
-            if matched_prefix
-            else ""
-        ),
-        "null_route": null_route,
-        "route_type": route_type,
-        "interface": interface,
-        "next_hop": next_hop,
-    }
-
-def parse_mpls_output(output):
-    records = []
-
-    for line in output.splitlines():
-        prefix_match = MPLS_PREFIX_RE.search(line)
-
-        if not prefix_match:
+        if len(parts) < 4:
             continue
 
-        try:
-            prefix = ipaddress.ip_network(
-                prefix_match.group(1),
-                strict=False,
-            )
+        interface = parts[0]
 
-        except ValueError:
+        description = ""
+
+        status = ""
+
+        vlan = ""
+
+        speed = ""
+
+        if len(parts) == 6:
+
+            description = parts[1]
+            status = parts[2]
+            vlan = parts[3]
+            speed = parts[5]
+
+        elif len(parts) >= 7:
+
+            description = parts[1]
+            status = parts[2]
+            vlan = parts[3]
+            speed = parts[5]
+
+        else:
+
             continue
 
-        before_prefix = line[
-            :prefix_match.start()
-        ].strip()
-
-        after_prefix = line[
-            prefix_match.end():
-        ].strip()
-
-        before_tokens = before_prefix.split()
-
-        local_label = (
-            before_tokens[0]
-            if before_tokens
-            else ""
-        )
-
-        outgoing_label = " ".join(
-            before_tokens[1:]
-        )
-
-        interface_match = MPLS_INTERFACE_RE.search(
-            after_prefix
-        )
-
-        interface = (
-            interface_match.group(0)
-            if interface_match
-            else ""
-        )
-
-        next_hop = ""
-
-        ip_match = re.search(
-            r"\b\d{1,3}(?:\.\d{1,3}){3}\b",
-            after_prefix,
-        )
-
-        if ip_match:
-            next_hop = ip_match.group(0)
-
-        records.append({
-            "prefix": prefix,
-            "local_label": local_label,
-            "outgoing_label": outgoing_label,
-            "interface": interface,
-            "next_hop": next_hop,
-        })
-
-    return records
-
-def get_mpls_info(records, lookup_ip):
-    matches = [
-        record
-        for record in records
-        if lookup_ip in record["prefix"]
-    ]
-
-    if not matches:
-        return {
-            "present": False,
-            "matched_prefix": "",
-            "local_label": "",
-            "outgoing_label": "",
-            "interface": "",
-            "next_hop": "",
+        interfaces[interface] = {
+            "description": description.strip(),
+            "status": status.strip(),
+            "vlan": vlan.strip(),
+            "speed": speed.strip()
         }
 
-    match = max(
-        matches,
-        key=lambda record: record["prefix"].prefixlen,
+    return interfaces
+
+
+def parse_interface_config(cfg):
+
+    mode = ""
+
+    native_vlan = ""
+
+    allowed_vlans = ""
+
+    m = re.search(
+        r'switchport mode (\S+)',
+        cfg,
+        re.I
     )
 
-    return {
-        "present": True,
-        "matched_prefix": str(match["prefix"]),
-        "local_label": match["local_label"],
-        "outgoing_label": match["outgoing_label"],
-        "interface": match["interface"],
-        "next_hop": match["next_hop"],
-    }
+    if m:
+        mode = m.group(1)
 
-def process_device(
-    host,
-    isp,
-    username,
-    password,
-    subnets,
-    vrf,
-):
-    results = []
-    conn = None
-
-    try:
-        print(f"[{host}] Connecting...")
-
-        device_type = detect_device_type(
-            host,
-            username,
-            password,
-        )
-
-        conn = ConnectHandler(
-            device_type=device_type,
-            host=host,
-            username=username,
-            password=password,
-            fast_cli=False,
-            banner_timeout=60,
-            auth_timeout=60,
-            conn_timeout=30,
-        )
-
-        print(f"[{host}] Connected ({device_type})")
-
-        try:
-            send_command(
-                conn,
-                host,
-                "terminal length 0",
-                read_timeout=30,
-            )
-
-        except Exception:
-            pass
-
-        arp_output = send_command(
-            conn,
-            host,
-            build_arp_command(
-                device_type,
-                vrf,
-            ),
-        )
-
-        vlan_output = send_command(
-            conn,
-            host,
-            "show vlan brief",
-        )
-
-        vlan_db = build_vlan_db(vlan_output)
-
-        mpls_records = []
-
-        try:
-            mpls_output = send_command(
-                conn,
-                host,
-                build_mpls_command(device_type),
-            )
-
-            mpls_records = parse_mpls_output(
-                mpls_output
-            )
-
-        except Exception as exc:
-            print(
-                f"[{host}] MPLS lookup unavailable: "
-                f"{exc}"
-            )
-
-        for index, subnet in enumerate(
-            subnets,
-            start=1,
-        ):
-            print(
-                f"[{host}] Subnet "
-                f"{index}/{len(subnets)} {subnet}"
-            )
-
-            network = ipaddress.ip_network(
-                subnet,
-                strict=False,
-            )
-
-            lookup_ip = get_lookup_ip(network)
-
-            route = get_route_info(
-                conn,
-                host,
-                subnet,
-                vrf,
-            )
-
-            mpls = get_mpls_info(
-                mpls_records,
-                lookup_ip,
-            )
-
-            vlan_id, vlan_name = get_vlan_info(
-                route["interface"],
-                vlan_db,
-            )
-
-            arp_count = get_arp_count(
-                arp_output,
-                subnet,
-            )
-
-            utilization = get_utilization(
-                subnet,
-                arp_count,
-            )
-
-            if route["null_route"]:
-                decom_candidate = "NO"
-                decom_reason = (
-                    "Intentional null/discard route"
-                )
-
-            else:
-                decom_candidate, decom_reason = (
-                    classify_decom_candidate(
-                        route["route_present"],
-                        arp_count,
-                    )
-                )
-
-            results.append([
-                subnet,
-                str(network.network_address),
-                network.prefixlen,
-                str(network.netmask),
-                str(lookup_ip),
-                route["matched_prefix"],
-                "YES" if route["exact_route"] else "NO",
-                host,
-                isp,
-                device_type,
-                vrf or "global/default",
-                "YES" if route["route_present"] else "NO",
-                route["route_type"],
-                route["interface"],
-                vlan_id,
-                vlan_name,
-                route["next_hop"],
-                "YES" if mpls["present"] else "NO",
-                mpls["matched_prefix"],
-                mpls["local_label"],
-                mpls["outgoing_label"],
-                mpls["interface"],
-                mpls["next_hop"],
-                arp_count,
-                utilization,
-                "YES" if route["null_route"] else "NO",
-                decom_candidate,
-                decom_reason,
-            ])
-
-        print(
-            f"[{host}] Finished "
-            f"{len(subnets)} subnets"
-        )
-
-    except Exception as exc:
-        print(f"[{host}] FAILED: {exc}")
-
-        with FAILED_LOCK:
-            FAILED_DEVICES.append([
-                host,
-                str(exc),
-            ])
-
-    finally:
-        if conn:
-            try:
-                conn.disconnect()
-            except Exception:
-                pass
-
-    return results
-
-def parse_subnet(value, label):
-    value = value.strip()
-
-    if "/" not in value:
-        raise ValueError(
-            f"{label} must be entered in CIDR form, "
-            "e.g. 10.190.0.0/24"
-        )
-
-    return ipaddress.ip_network(
-        value,
-        strict=False,
+    m = re.search(
+        r'switchport trunk native vlan (\d+)',
+        cfg,
+        re.I
     )
 
-def build_subnet_range(start_net, end_net):
-    if start_net.prefixlen != end_net.prefixlen:
-        raise ValueError(
-            "Starting and ending subnets must use "
-            "the same mask"
-        )
+    if m:
+        native_vlan = m.group(1)
 
-    if end_net.network_address < start_net.network_address:
-        raise ValueError(
-            "Ending subnet must be greater than or "
-            "equal to starting subnet"
-        )
+    m = re.search(
+        r'switchport trunk allowed vlan ([0-9,\-]+)',
+        cfg,
+        re.I
+    )
 
-    prefix = start_net.prefixlen
-    subnets = []
-    current = start_net.network_address
+    if m:
+        allowed_vlans = m.group(1)
 
-    while current <= end_net.network_address:
-        network = ipaddress.ip_network(
-            f"{current}/{prefix}",
-            strict=False,
-        )
+    return mode, native_vlan, allowed_vlans
 
-        subnets.append(str(network))
-        current = current + network.num_addresses
-
-    return subnets
-
-def write_report(results):
-    with open(
-        REPORT_FILE,
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as file_handle:
-        writer = csv.writer(file_handle)
-
-        writer.writerow([
-            "IP Subnet",
-            "Network Address",
-            "Prefix Length",
-            "Subnet Mask",
-            "Lookup IP",
-            "Matched Route Prefix",
-            "Exact Route",
-            "Device",
-            "ISP/Provider",
-            "Device Type",
-            "VRF",
-            "Route Present",
-            "Route Type",
-            "Interface",
-            "VLAN ID",
-            "VLAN Name",
-            "Next Hop",
-            "MPLS Entry Present",
-            "MPLS Matched Prefix",
-            "MPLS Local Label",
-            "MPLS Outgoing Label",
-            "MPLS Interface",
-            "MPLS Next Hop",
-            "# ARPs",
-            "ARP Utilization %",
-            "Null Route",
-            "Decom Candidate",
-            "Decom Reason",
-        ])
-
-        writer.writerows(results)
-
-def write_audit_log():
-    with open(
-        AUDIT_FILE,
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as file_handle:
-        writer = csv.writer(file_handle)
-
-        writer.writerow([
-            "Timestamp",
-            "Device",
-            "Command",
-        ])
-
-        writer.writerows(COMMAND_LOG)
-
-def write_failed_devices():
-    with open(
-        FAILED_FILE,
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as file_handle:
-        writer = csv.writer(file_handle)
-
-        writer.writerow([
-            "Device",
-            "Error",
-        ])
-
-        writer.writerows(FAILED_DEVICES)
 
 def main():
-    start_time = datetime.now()
 
-    hosts = [
-        host.strip()
-        for host in input(
-            "Hosts (comma delimited): "
-        ).split(",")
-        if host.strip()
-    ]
-
-    if not hosts:
-        print("No hosts provided. Exiting.")
-        return
-
-    isp_by_host = {}
-
-    for host in hosts:
-        isp_by_host[host] = (
-            input(
-                f"ISP/provider for {host}: "
-            ).strip()
-            or "Unknown"
-        )
-
-    start_net = parse_subnet(
-        input(
-            "Starting subnet/mask "
-            "(e.g. 10.190.0.0/24): "
-        ),
-        "Starting subnet",
-    )
-
-    end_net = parse_subnet(
-        input(
-            "Ending subnet/mask "
-            "(e.g. 10.190.5.0/24): "
-        ),
-        "Ending subnet",
-    )
-
-    vrf = input(
-        "VRF name, blank for global/default: "
+    devices = input(
+        "\nEnter device names (comma separated): "
     ).strip()
 
     username = input(
         "Username: "
     ).strip()
 
-    password = getpass.getpass(
+    password = getpass(
         "Password: "
     )
 
-    subnets = build_subnet_range(
-        start_net,
-        end_net,
-    )
+    hosts = [x.strip() for x in devices.split(",") if x.strip()]
 
-    print("\n" + "=" * 60)
-    print("Subnet Audit Tool")
-    print("=" * 60)
-    print(f"Devices: {len(hosts)}")
-    print(f"VRF: {vrf or 'global/default'}")
-    print(f"Subnet Range: {start_net} -> {end_net}")
-    print(
-        f"Mask: /{start_net.prefixlen} "
-        f"({start_net.netmask})"
-    )
-    print(f"Total Subnets: {len(subnets)}")
+    report = []
 
-    results = []
+    for host in hosts:
 
-    with ThreadPoolExecutor(
-        max_workers=min(5, len(hosts))
-    ) as pool:
-        futures = [
-            pool.submit(
-                process_device,
+        try:
+
+            print(f"\nConnecting to {host} ...")
+
+            conn = connect_device(
                 host,
-                isp_by_host[host],
                 username,
-                password,
-                subnets,
-                vrf,
+                password
             )
-            for host in hosts
-        ]
 
-        for future in as_completed(futures):
-            results.extend(future.result())
+            conn.disable_paging()
 
-    results.sort(
-        key=lambda row: (
-            row[7],
-            ipaddress.ip_network(
-                row[0],
-                strict=False,
-            ).network_address,
+            mgmt_ip = resolve_ip(host)
+
+            output = conn.send_command(
+                "show interface status",
+                read_timeout=120
+            )
+
+            interfaces = parse_interface_status(output)
+
+            print(
+                f"Discovered {len(interfaces)} interfaces"
+            )
+
+            for interface, data in interfaces.items():
+
+                description = data["description"]
+
+                try:
+
+                    cfg = conn.send_command(
+                        f"show running-config interface {interface}",
+                        read_timeout=30
+                    )
+
+                except Exception:
+
+                    cfg = ""
+
+                mode, native_vlan, allowed_vlans = \
+                    parse_interface_config(cfg)
+
+                vendor = detect_vendor(description)
+
+                circuit_type = detect_circuit_type(
+                    description
+                )
+
+                attached_device = find_attached_device(
+                    description
+                )
+
+                row = {
+
+                    "Device": host,
+                    "Management IP": mgmt_ip,
+                    "Interface": interface,
+
+                    "Interface Status": data["status"],
+                    "Admin Status": data["status"],
+                    "Operational Status": data["status"],
+
+                    "VLAN": data["vlan"],
+                    "Mode": mode,
+                    "Native VLAN": native_vlan,
+                    "Allowed VLANs": allowed_vlans,
+
+                    "Circuit Vendor": vendor,
+                    "Circuit IDs": "",
+
+                    "Circuit Type": circuit_type,
+
+                    "Circuit Directly Attached":
+                        attached_device,
+
+                    "Matched Keywords":
+                        matched_keywords(description),
+
+                    "Description": description,
+
+                    "Notes":
+                        build_notes(
+                            data["status"],
+                            vendor
+                        )
+                }
+
+                report.append(row)
+
+            conn.disconnect()
+
+        except Exception as e:
+
+            print(
+                f"ERROR connecting to {host}: {e}"
+            )
+
+    fields = [
+
+        "Device",
+        "Management IP",
+        "Interface",
+
+        "Interface Status",
+        "Admin Status",
+        "Operational Status",
+
+        "VLAN",
+        "Mode",
+        "Native VLAN",
+        "Allowed VLANs",
+
+        "Circuit Vendor",
+        "Circuit IDs",
+        "Circuit Type",
+        "Circuit Directly Attached",
+
+        "Matched Keywords",
+
+        "Description",
+
+        "Notes"
+    ]
+
+    with open(
+        OUTPUT_CSV,
+        "w",
+        newline=""
+    ) as f:
+
+        writer = csv.DictWriter(
+            f,
+            fieldnames=fields
         )
-    )
 
-    write_report(results)
-    write_audit_log()
-    write_failed_devices()
+        writer.writeheader()
+        writer.writerows(report)
 
-    runtime = datetime.now() - start_time
+    print("\n---------------------------------")
+    print(f"CSV written to {OUTPUT_CSV}")
+    print(f"Interfaces processed: {len(report)}")
+    print("---------------------------------")
 
-    print("\n" + "=" * 60)
-    print("Processing Complete")
-    print("=" * 60)
-    print(f"Records Generated : {len(results)}")
-    print(f"Failed Devices    : {len(FAILED_DEVICES)}")
-    print(f"Runtime           : {runtime}")
-
-    print("\nGenerated Files:")
-    print(f"  {REPORT_FILE}")
-    print(f"  {AUDIT_FILE}")
-    print(f"  {FAILED_FILE}")
 
 if __name__ == "__main__":
     main()
