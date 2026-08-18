@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 
+import argparse
 import csv
 import getpass
+import logging
 import re
 import sys
 
@@ -27,6 +29,8 @@ if MacLookup is not None:
 
 
 CSV_FILE = "inventory_report.csv"
+
+logger = logging.getLogger(__name__)
 
 INTERFACE_RE = (
     r"(?:Eth|Gi|Te|Po|Ethernet|GigabitEthernet|TenGigabitEthernet|"
@@ -155,25 +159,46 @@ def display_interface_status(interface, status, fallback_status=""):
 def parse_interface_status(output):
     results = {}
 
-    for line in output.splitlines():
+    for line_number, line in enumerate(output.splitlines(), start=1):
         match = re.match(
             rf"^\s*(?P<interface>{INTERFACE_RE})\s+"
             rf"(?:(?P<name>.*?)\s+)?"
             r"(?P<status>connected|notconnect|disabled|suspended|"
-            r"err-disabled|xcvrd|xcvr|unknown)\s+"
+            r"err-disabled|xcvrd|xcvr|xcvrAbsn|xcvrAbsent|"
+            r"sfpAbsent|inactive|link-down|unknown)\s+"
             r"(?P<vlan>\S+)",
             line,
             re.IGNORECASE,
         )
 
         if not match:
+            if re.match(rf"^\s*{INTERFACE_RE}\b", line):
+                logger.warning(
+                    "Unable to parse interface status line %d: %s",
+                    line_number,
+                    line.strip(),
+                )
+            elif line.strip():
+                logger.debug(
+                    "Ignoring non-interface status line %d: %s",
+                    line_number,
+                    line.strip(),
+                )
             continue
 
         interface = normalize_interface_name(match.group("interface"))
+        status = match.group("status")
+        vlan = match.group("vlan")
         results[interface] = {
-            "status": match.group("status"),
-            "vlan": match.group("vlan"),
+            "status": status,
+            "vlan": vlan,
         }
+        logger.debug(
+            "Parsed interface status: %s status=%s vlan=%s",
+            interface,
+            status,
+            vlan,
+        )
 
     return results
 
@@ -439,6 +464,15 @@ def collect_host(hostname, username, password):
     switchport_data = parse_interface_switchport(show_switchport)
     mac_data = parse_mac_table(show_mac)
 
+    for iface, interface_data in interfaces.items():
+        if iface not in status_data:
+            logger.warning(
+                "%s: no parsed status for %s; description operational status=%r",
+                hostname,
+                iface,
+                interface_data.get("oper", ""),
+            )
+
     rows = []
 
     for iface, data in interfaces.items():
@@ -507,6 +541,22 @@ def collect_host(hostname, username, password):
 
 
 def main():
+    parser = argparse.ArgumentParser(
+        description="Collect Cisco NX-OS interface inventory into a CSV file."
+    )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="enable detailed parser and collection logging",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.WARNING,
+        format="%(asctime)s %(levelname)s %(message)s",
+    )
+
     username = input("Username: ")
     password = getpass.getpass("Password: ")
     host_input = input("Switch Hostname/IP(s), comma-delimited: ")
