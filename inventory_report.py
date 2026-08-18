@@ -13,6 +13,18 @@ from netmiko.exceptions import (
     NetmikoTimeoutException,
 )
 
+try:
+    from mac_vendor_lookup import MacLookup
+except ImportError:
+    MacLookup = None
+
+_MAC_LOOKUP = None
+if MacLookup is not None:
+    try:
+        _MAC_LOOKUP = MacLookup()
+    except Exception:
+        _MAC_LOOKUP = None
+
 
 CSV_FILE = "inventory_report.csv"
 
@@ -279,6 +291,57 @@ def parse_mac_table(output):
     return mac_data
 
 
+def lookup_mac_vendor(mac_address):
+    """Return the manufacturer associated with a MAC OUI when available."""
+    if _MAC_LOOKUP is None:
+        return "Unknown"
+
+    try:
+        return _MAC_LOOKUP.lookup(mac_address)
+    except Exception:
+        return "Unknown"
+
+
+def classify_device(description, vendors):
+    """Best-effort device classification; MAC OUIs cannot identify exact models."""
+    text = f"{description} {' '.join(vendors)}".upper()
+
+    description_types = [
+        ("Firewall", r"\b(FW|FIREWALL)\b"),
+        ("Wireless Access Point", r"\b(AP|ACCESS POINT|WAP|WIRELESS)\b"),
+        ("IP Phone", r"\b(IP PHONE|VOIP|PHONE)\b"),
+        ("Printer", r"\b(PRINTER|MFP|COPIER)\b"),
+        ("Camera", r"\b(CAMERA|CAM|CCTV)\b"),
+        ("Server", r"\b(SERVER|ESXI|HYPERV|HYPER-V)\b"),
+    ]
+
+    for device_type, pattern in description_types:
+        if re.search(pattern, description, re.IGNORECASE):
+            return device_type
+
+    if re.search(
+        r"CISCO|ARISTA|JUNIPER|FORTINET|PALO ALTO|PALOALTO|"
+        r"MERAKI|UBIQUITI|RUCKUS|BROCADE|EXTREME NETWORKS|HUAWEI",
+        text,
+    ):
+        return "Network Device"
+
+    if re.search(
+        r"VMWARE|MICROSOFT|HYPER-V|QEMU|KVM|VIRTUALBOX|PARALLELS",
+        text,
+    ):
+        return "Virtual Machine/Hypervisor"
+
+    if re.search(
+        r"HEWLETT[- ]PACKARD|HP INC|BROTHER|CANON|EPSON|LEXMARK|"
+        r"RICOH|KONICA MINOLTA",
+        text,
+    ):
+        return "Printer"
+
+    return "Unknown"
+
+
 def build_notes(row):
     notes = []
 
@@ -373,11 +436,16 @@ def collect_host(hostname, username, password):
             },
         )
         mac_count = mac_info["count"]
-        mac_addresses = (
-            ", ".join(mac_info["addresses"])
-            if 0 < mac_count <= 2
-            else ""
-        )
+        mac_list = mac_info["addresses"]
+        mac_addresses = ", ".join(mac_list) if 0 < mac_count <= 2 else ""
+        mac_vendors = []
+        for mac_address in mac_list:
+            vendor = lookup_mac_vendor(mac_address)
+            if vendor != "Unknown" and vendor not in mac_vendors:
+                mac_vendors.append(vendor)
+
+        mac_vendor = "; ".join(sorted(mac_vendors)) if mac_vendors else "Unknown"
+        device_type = classify_device(desc, mac_vendors)
 
         row = {
             "Device": hostname,
@@ -398,6 +466,8 @@ def collect_host(hostname, username, password):
             "Description": desc,
             "MAC Count": mac_count,
             "MAC Addresses": mac_addresses,
+            "MAC Vendor": mac_vendor,
+            "Device Type": device_type,
         }
 
         row["Notes"] = build_notes(row)
@@ -440,6 +510,8 @@ def main():
         "Description",
         "MAC Count",
         "MAC Addresses",
+        "MAC Vendor",
+        "Device Type",
         "Notes",
     ]
 
