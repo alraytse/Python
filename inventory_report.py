@@ -9,6 +9,12 @@ from netmiko import ConnectHandler
 OUTPUT_CSV = "inventory_report.csv"
 OUI_FILE = "oui.csv"
 
+DEVICE_TYPES = [
+    "cisco_xe",
+    "cisco_ios",
+    "cisco_nxos"
+]
+
 # Leave only the legacy algorithms enabled for older Cisco SSH servers.
 # The remaining allowed algorithms are diffie-hellman-group14-sha1 and ssh-rsa.
 LEGACY_SSH_DISABLED_ALGORITHMS = {
@@ -295,17 +301,20 @@ def is_asr_device(host):
 def get_device_profile(host, platform):
     platform = platform.lower().strip()
 
-    if platform == "ios":
+    if platform in ["ios", "cisco_ios"]:
         return "cisco_ios", False
 
-    if platform == "asr":
-        return "cisco_ios", True
+    if platform in ["xe", "cisco_xe"]:
+        return "cisco_xe", False
 
-    if platform == "nxos":
+    if platform == "asr":
+        return "cisco_xe", True
+
+    if platform in ["nxos", "cisco_nxos"]:
         return "cisco_nxos", False
 
     if is_asr_device(host):
-        return "cisco_ios", True
+        return "cisco_xe", True
 
     return "cisco_nxos", False
 
@@ -346,10 +355,15 @@ def main():
     ).strip()
 
     platform = input(
-        "Platform [auto/nxos/ios/asr] (default: auto): "
+        "Platform [auto/xe/ios/nxos/asr] (default: auto): "
     ).strip().lower() or "auto"
 
-    if platform not in ["auto", "nxos", "ios", "asr"]:
+    if platform not in [
+        "auto", "xe", "cisco_xe",
+        "ios", "cisco_ios",
+        "nxos", "cisco_nxos",
+        "asr"
+    ]:
         print(f"Unknown platform '{platform}'. Using auto detection.")
         platform = "auto"
 
@@ -411,7 +425,7 @@ def main():
 
             interface_output = conn.send_command(
                 "show interfaces status"
-                if device_type == "cisco_ios"
+                if device_type in ["cisco_ios", "cisco_xe"]
                 else "show interface status",
                 read_timeout=120
             )
