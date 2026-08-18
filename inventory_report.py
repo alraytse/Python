@@ -260,9 +260,32 @@ def get_mac_output(conn, interface):
         return f"ERROR: {error}"
 
 
-def connect_device(host, username, password):
+def is_asr_device(host):
+    return host.strip().upper().startswith("ASR")
+
+
+def parse_asr_interface_description(line):
+    parts = line.strip().split(None, 3)
+
+    if len(parts) < 3 or parts[0].lower() == "interface":
+        return None
+
+    if not re.match(
+        r"^(Gi|GigabitEthernet|Te|TenGigabitEthernet|Fo|FortyGigabitEthernet|"
+        r"Hu|HundredGigE|Eth|Ethernet|Po|Port-channel|Lo|Loopback|Tu|Tunnel|"
+        r"Vl|Vlan|Mgmt|Management)",
+        parts[0],
+        re.IGNORECASE
+    ):
+        return None
+
+    description = parts[3] if len(parts) == 4 else ""
+    return parts[0], description
+
+
+def connect_device(host, username, password, device_type):
     return ConnectHandler(
-        device_type="cisco_nxos",
+        device_type=device_type,
         host=host,
         username=username,
         password=password,
@@ -293,20 +316,46 @@ def main():
         try:
             print(f"Connecting to {host} ...")
 
+            asr_device = is_asr_device(host)
+            device_type = "cisco_ios" if asr_device else "cisco_nxos"
+
             conn = connect_device(
                 host,
                 username,
-                password
+                password,
+                device_type
             )
 
             conn.disable_paging()
+            mgmt_ip = resolve_ip(host)
+
+            if asr_device:
+                interface_output = conn.send_command(
+                    "show interfaces description",
+                    read_timeout=120
+                )
+
+                for line in interface_output.splitlines():
+                    parsed = parse_asr_interface_description(line)
+
+                    if not parsed:
+                        continue
+
+                    interface, description = parsed
+
+                    report.append({
+                        "Device": host,
+                        "Management IP": mgmt_ip,
+                        "Interface": interface,
+                        "Description": description
+                    })
+
+                continue
 
             interface_output = conn.send_command(
                 "show interface status",
                 read_timeout=120
             )
-
-            mgmt_ip = resolve_ip(host)
 
             for line in interface_output.splitlines():
                 if not re.match(
