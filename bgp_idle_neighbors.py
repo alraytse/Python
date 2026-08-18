@@ -70,6 +70,20 @@ def parse_idle_neighbors(output):
     return idle_neighbors
 
 
+def find_neighbor_config(bgp_config, neighbor):
+    """Return BGP configuration lines that directly reference a neighbor."""
+    pattern = re.compile(
+        rf"^\s*neighbor\s+{re.escape(neighbor)}\b.*$",
+        re.IGNORECASE,
+    )
+
+    return [
+        line.strip()
+        for line in bgp_config.splitlines()
+        if pattern.match(line)
+    ]
+
+
 def collect_switch(hostname, username, password):
     device = {
         "device_type": DEVICE_TYPE,
@@ -89,12 +103,17 @@ def collect_switch(hostname, username, password):
             "show ip bgp summary",
             read_timeout=60,
         )
+        bgp_config = connection.send_command(
+            "show running-config | section ^router bgp",
+            read_timeout=60,
+        )
 
         idle_neighbors = parse_idle_neighbors(output)
 
         return {
             "hostname": hostname,
             "output": output,
+            "bgp_config": bgp_config,
             "idle_neighbors": idle_neighbors,
             "error": "",
         }
@@ -103,6 +122,7 @@ def collect_switch(hostname, username, password):
         return {
             "hostname": hostname,
             "output": "",
+            "bgp_config": "",
             "idle_neighbors": [],
             "error": "Authentication failed",
         }
@@ -111,6 +131,7 @@ def collect_switch(hostname, username, password):
         return {
             "hostname": hostname,
             "output": "",
+            "bgp_config": "",
             "idle_neighbors": [],
             "error": "Connection timed out",
         }
@@ -119,6 +140,7 @@ def collect_switch(hostname, username, password):
         return {
             "hostname": hostname,
             "output": "",
+            "bgp_config": "",
             "idle_neighbors": [],
             "error": str(exc),
         }
@@ -177,13 +199,38 @@ def main():
 
         print(result["output"])
 
+        if not result["idle_neighbors"]:
+            print("No non-shutdown idle BGP neighbors found.")
+            continue
+
+        print("\nNon-shutdown idle neighbors requiring review:")
+
         for neighbor in result["idle_neighbors"]:
+            neighbor_config = find_neighbor_config(
+                result["bgp_config"],
+                neighbor["neighbor"],
+            )
+            config_evidence = " | ".join(neighbor_config)
+            config_match = "Yes" if neighbor_config else "No direct match"
+
+            print(
+                f"  {neighbor['neighbor']} - {neighbor['state']} - "
+                "Review Required"
+            )
+            print(f"    Configuration match: {config_match}")
+            if neighbor_config:
+                for config_line in neighbor_config:
+                    print(f"    {config_line}")
+
             csv_rows.append(
                 {
                     "Timestamp": timestamp,
                     "Switch": hostname,
                     "BGP Neighbor": neighbor["neighbor"],
                     "BGP State": neighbor["state"],
+                    "Shutdown Assessment": "Review Required",
+                    "Configuration Match": config_match,
+                    "BGP Configuration Evidence": config_evidence,
                     "Raw Neighbor Entry": neighbor["raw_line"],
                 }
             )
@@ -194,6 +241,9 @@ def main():
             "Switch",
             "BGP Neighbor",
             "BGP State",
+            "Shutdown Assessment",
+            "Configuration Match",
+            "BGP Configuration Evidence",
             "Raw Neighbor Entry",
         ]
         writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
