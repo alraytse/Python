@@ -138,8 +138,8 @@ def detect_circuit_type(description):
         if keyword in description_upper
     ]
 
-    return ",".join(sorted(set(found_types))) \\
-        if found_types else "Unknown"
+    return ",".join(sorted(set(found_types))) if found_types else "Unknown"
+
 
 
 def matched_keywords(description):
@@ -360,19 +360,6 @@ def main():
                     mac_output
                 )
 
-                # Display MAC details only when two or fewer MACs are present.
-                display_mac_output = (
-                    mac_output
-                    if len(mac_addresses) <= 2
-                    else "MAC output hidden: more than 2 MAC addresses found"
-                )
-
-                display_mac_addresses = (
-                    ", ".join(mac_addresses)
-                    if len(mac_addresses) <= 2
-                    else ""
-                )
-
                 manufacturer = determine_manufacturer(
                     mac_addresses,
                     oui_database
@@ -409,9 +396,12 @@ def main():
                         matched_keyword_definitions(description)
                     ),
                     "Description": description,
-                    "MAC Address Output": display_mac_output,
                     "MAC Count": len(mac_addresses),
-                    "MAC Addresses": display_mac_addresses,
+                    "MAC Addresses": (
+                        ", ".join(mac_addresses)
+                        if len(mac_addresses) <= 2
+                        else ""
+                    ),
                     "Device Manufacturer": manufacturer,
                     "Notes": build_notes(
                         status,
@@ -445,7 +435,6 @@ def main():
         "Matched Keywords",
         "Matched Keyword Definitions",
         "Description",
-        "MAC Address Output",
         "MAC Count",
         "MAC Addresses",
         "Device Manufacturer",
