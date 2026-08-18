@@ -7,6 +7,7 @@ from getpass import getpass
 from netmiko import ConnectHandler
 
 OUTPUT_CSV = "inventory_report.csv"
+OUI_FILE = "oui.csv"
 
 VENDOR_KEYWORDS = {
     "VERIZON": "Verizon",
@@ -54,11 +55,63 @@ TYPE_KEYWORDS = {
     "WAN": "WAN"
 }
 
+MAC_PATTERN = re.compile(
+    r"\b(?:[0-9A-F]{2}[:-]){5}[0-9A-F]{2}\b"
+    r"|\b(?:[0-9A-F]{4}\.){2}[0-9A-F]{4}\b",
+    re.IGNORECASE
+)
+
 def resolve_ip(hostname):
     try:
         return socket.gethostbyname(hostname)
     except Exception:
         return hostname
+
+def normalize_mac(value):
+    return re.sub(r"[^0-9A-F]", "", value.upper())
+
+def load_oui_database(filename):
+    oui_database = {}
+
+    try:
+        with open(filename, newline="", encoding="utf-8") as file:
+            reader = csv.reader(file)
+
+            for row in reader:
+                if len(row) < 2:
+                    continue
+
+                oui = normalize_mac(row[0])[:6]
+                manufacturer = row[1].strip()
+
+                if len(oui) == 6 and manufacturer:
+                    oui_database[oui] = manufacturer
+
+    except FileNotFoundError:
+        print(
+            f"Warning: {filename} not found. "
+            "MAC manufacturer lookup will return Unknown."
+        )
+
+    return oui_database
+
+def extract_mac_addresses(mac_output):
+    matches = MAC_PATTERN.findall(mac_output)
+
+    return sorted(
+        set(normalize_mac(mac) for mac in matches)
+    )
+
+def determine_manufacturer(mac_addresses, oui_database):
+    if len(mac_addresses) == 0:
+        return "No MAC Address"
+
+    if len(mac_addresses) >= 2:
+        return "Multiple MAC Addresses"
+
+    oui = mac_addresses[0][:6]
+
+    return oui_database.get(oui, "Unknown")
 
 def detect_vendor(description):
     description_upper = description.upper()
@@ -78,7 +131,8 @@ def detect_circuit_type(description):
         if keyword in description_upper
     ]
 
-    return ",".join(sorted(set(found_types))) if found_types else "Unknown"
+    return ",".join(sorted(set(found_types))) \
+        if found_types else "Unknown"
 
 def matched_keywords(description):
     description_upper = description.upper()
@@ -179,15 +233,6 @@ def parse_interface_config(cfg):
 
     return mode, native, allowed
 
-def connect_device(host, username, password):
-    return ConnectHandler(
-        device_type="cisco_nxos",
-        host=host,
-        username=username,
-        password=password,
-        fast_cli=False
-    )
-
 def get_mac_output(conn, interface):
     try:
         output = conn.send_command(
@@ -200,6 +245,15 @@ def get_mac_output(conn, interface):
     except Exception as error:
         return f"ERROR: {error}"
 
+def connect_device(host, username, password):
+    return ConnectHandler(
+        device_type="cisco_nxos",
+        host=host,
+        username=username,
+        password=password,
+        fast_cli=False
+    )
+
 def main():
     devices = input(
         "Enter device names (comma separated): "
@@ -208,6 +262,7 @@ def main():
     username = input("Username: ").strip()
     password = getpass("Password: ")
 
+    oui_database = load_oui_database(OUI_FILE)
     report = []
 
     hosts = [
@@ -285,6 +340,15 @@ def main():
                     interface
                 )
 
+                mac_addresses = extract_mac_addresses(
+                    mac_output
+                )
+
+                manufacturer = determine_manufacturer(
+                    mac_addresses,
+                    oui_database
+                )
+
                 circuit_id = extract_circuit_id(description)
 
                 if not circuit_id:
@@ -317,6 +381,9 @@ def main():
                     ),
                     "Description": description,
                     "MAC Address Output": mac_output,
+                    "MAC Count": len(mac_addresses),
+                    "MAC Addresses": ", ".join(mac_addresses),
+                    "Device Manufacturer": manufacturer,
                     "Notes": build_notes(
                         status,
                         vendor,
@@ -350,6 +417,9 @@ def main():
         "Matched Keyword Definitions",
         "Description",
         "MAC Address Output",
+        "MAC Count",
+        "MAC Addresses",
+        "Device Manufacturer",
         "Notes"
     ]
 
