@@ -131,15 +131,16 @@ def normalize_interface_name(interface):
     return interface
 
 
-def display_interface_status(interface, status):
-    """Format port-channel state as PoX/up or PoX/down."""
-    status = status.lower().strip()
+def display_interface_status(interface, status, fallback_status=""):
+    """Format port-channel state and prevent blank status values."""
+    status = (status or fallback_status or "unknown").lower().strip()
 
     if interface.startswith("Po"):
-        if status == "connected":
+        if status in {"connected", "up"}:
             return f"{interface}/up"
 
         if status in {
+            "down",
             "notconnect",
             "disabled",
             "suspended",
@@ -148,7 +149,7 @@ def display_interface_status(interface, status):
         }:
             return f"{interface}/down"
 
-    return status
+    return status or "unknown"
 
 
 def parse_interface_status(output):
@@ -473,6 +474,7 @@ def collect_host(hostname, username, password):
         interface_status = display_interface_status(
             iface,
             raw_interface_status,
+            data.get("oper", ""),
         )
 
         row = {
