@@ -243,7 +243,7 @@ def parse_interface_switchport(output):
 
 
 def parse_mac_table(output):
-    mac_count = {}
+    mac_data = {}
 
     for line in output.splitlines():
         mac_match = re.search(
@@ -265,9 +265,18 @@ def parse_mac_table(output):
             continue
 
         interface = normalize_interface_name(interface_match.group("interface"))
-        mac_count[interface] = mac_count.get(interface, 0) + 1
+        mac_address = mac_match.group(0).lower()
 
-    return mac_count
+        if interface not in mac_data:
+            mac_data[interface] = {
+                "count": 0,
+                "addresses": [],
+            }
+
+        mac_data[interface]["count"] += 1
+        mac_data[interface]["addresses"].append(mac_address)
+
+    return mac_data
 
 
 def build_notes(row):
@@ -356,6 +365,20 @@ def collect_host(hostname, username, password):
             },
         )
 
+        mac_info = mac_data.get(
+            iface,
+            {
+                "count": 0,
+                "addresses": [],
+            },
+        )
+        mac_count = mac_info["count"]
+        mac_addresses = (
+            ", ".join(mac_info["addresses"])
+            if 0 < mac_count <= 2
+            else ""
+        )
+
         row = {
             "Device": hostname,
             "Management IP": mgmt_ip,
@@ -373,7 +396,8 @@ def collect_host(hostname, username, password):
             "Circuit Directly Attached": directly_attached(desc),
             "Matched Keywords": find_keywords(desc),
             "Description": desc,
-            "MAC Count": mac_data.get(iface, 0),
+            "MAC Count": mac_count,
+            "MAC Addresses": mac_addresses,
         }
 
         row["Notes"] = build_notes(row)
@@ -415,6 +439,7 @@ def main():
         "Matched Keywords",
         "Description",
         "MAC Count",
+        "MAC Addresses",
         "Notes",
     ]
 
