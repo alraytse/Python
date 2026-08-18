@@ -109,10 +109,23 @@ def main():
             for interface in get_interfaces(conn):
                 mac_addresses = get_mac_addresses(conn, interface)
 
+                # Display MAC addresses only when the interface has two or fewer.
+                mac_value = (
+                    ", ".join(mac_addresses)
+                    if len(mac_addresses) <= 2
+                    else ""
+                )
+
+                if len(mac_addresses) <= 2:
+                    print(
+                        f"{host} {interface} MAC addresses: "
+                        f"{mac_value or 'None'}"
+                    )
+
                 report.append({
                     "Device": host,
                     "Interface": interface,
-                    "MAC Addresses": ", ".join(mac_addresses),
+                    "MAC Addresses": mac_value,
                 })
 
         except Exception as error:
