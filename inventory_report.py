@@ -9,6 +9,34 @@ from netmiko import ConnectHandler
 OUTPUT_CSV = "inventory_report.csv"
 OUI_FILE = "oui.csv"
 
+# Leave only the legacy algorithms enabled for older Cisco SSH servers.
+# The remaining allowed algorithms are diffie-hellman-group14-sha1 and ssh-rsa.
+LEGACY_SSH_DISABLED_ALGORITHMS = {
+    "kex": [
+        "curve25519-sha256",
+        "curve25519-sha256@libssh.org",
+        "ecdh-sha2-nistp256",
+        "ecdh-sha2-nistp384",
+        "ecdh-sha2-nistp521",
+        "diffie-hellman-group18-sha512",
+        "diffie-hellman-group16-sha512",
+        "diffie-hellman-group14-sha256",
+        "diffie-hellman-group-exchange-sha256"
+    ],
+    "keys": [
+        "ssh-ed25519",
+        "ecdsa-sha2-nistp256",
+        "ecdsa-sha2-nistp384",
+        "ecdsa-sha2-nistp521",
+        "rsa-sha2-512",
+        "rsa-sha2-256"
+    ],
+    "pubkeys": [
+        "rsa-sha2-512",
+        "rsa-sha2-256"
+    ]
+}
+
 VENDOR_KEYWORDS = {
     "VERIZON": "Verizon",
     "ATT": "AT&T",
@@ -307,7 +335,8 @@ def connect_device(host, username, password, device_type):
         host=host,
         username=username,
         password=password,
-        fast_cli=False
+        fast_cli=False,
+        disabled_algorithms=LEGACY_SSH_DISABLED_ALGORITHMS
     )
 
 
