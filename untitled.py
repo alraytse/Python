@@ -1,454 +1,421 @@
 #!/usr/bin/env python3
 
-from netmiko import ConnectHandler
-import getpass
 import csv
+import getpass
 import re
-from datetime import datetime
-
-OUTPUT_FILE = (
-    f"circuit_inventory_"
-    f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
+import sys
+from netmiko import ConnectHandler
+from netmiko.exceptions import (
+    NetmikoAuthenticationException,
+    NetmikoTimeoutException,
 )
 
-###############################################################################
-# VENDOR DETECTION
-###############################################################################
+CSV_FILE = "inventory_report.csv"
 
-VENDOR_PATTERNS = {
-    "Verizon": [
-        r"verizon",
-        r"\bvrt\b",
-        r"\bvzw\b",
-        r"alter\.net",
-        r"uunet",
-    ],
-    "AT&T": [
-        r"att",
-        r"at&t",
-    ],
-    "Lumen": [
-        r"lumen",
-        r"centurylink",
-        r"\bctl\b",
-    ],
-    "Cogent": [
-        r"cogent",
-    ],
-    "Comcast": [
-        r"comcast",
-    ],
-    "Zayo": [
-        r"zayo",
-    ],
-}
+INTERFACE_RE = r"(?:Eth|Gi|Te|Po|Ethernet|GigabitEthernet|TenGigabitEthernet|Port-channel)\S+"
 
+def find_vendor(desc):
+    vendors = [
+        ("AT&T", r"\bAT\s*&\s*T\b"),
+        ("ATT", r"\bATT\b"),
+        ("VERIZON", r"\bVERIZON\b"),
+        ("CLINK", r"\bCLINK\b"),
+        ("CENTURYLINK", r"\bCENTURYLINK\b"),
+        ("LUMEN", r"\bLUMEN\b"),
+        ("COMCAST", r"\bCOMCAST\b"),
+        ("COGENT", r"\bCOGENT\b"),
+        ("CHARTER", r"\bCHARTER\b"),
+        ("SPECTRUM", r"\bSPECTRUM\b"),
+    ]
 
-def detect_vendor(text):
-
-    text = text.lower()
-
-    for vendor, patterns in VENDOR_PATTERNS.items():
-
-        for pattern in patterns:
-
-            if re.search(pattern, text, re.IGNORECASE):
-                return vendor
+    for vendor, pattern in vendors:
+        if re.search(pattern, desc, re.IGNORECASE):
+            return vendor
 
     return "Unknown"
 
+def find_circuit_id(desc):
+    patterns = [
+        r"\bCID\s*[:=]?\s*([A-Za-z0-9-]+)",
+        r"\bCIRCUIT\s*[:=]?\s*([A-Za-z0-9-]+)",
+        r"\b(\d{8,})\b",
+    ]
 
-###############################################################################
-# CIRCUIT ID EXTRACTION
-###############################################################################
+    for pattern in patterns:
+        match = re.search(pattern, desc, re.IGNORECASE)
+        if match:
+            return match.group(1)
 
-CIRCUIT_PATTERNS = [
-    r"\bCKT[- ]?[A-Z0-9\-]+\b",
-    r"\bCID[- ]?[A-Z0-9\-]+\b",
-    r"\bCIRCUIT[- ]?[A-Z0-9\-]+\b",
-    r"\bVZ[- ]?[A-Z0-9\-]+\b",
-    r"\bATT[- ]?[A-Z0-9\-]+\b",
-    r"\bCTL[- ]?[A-Z0-9\-]+\b",
-    r"\bCOGENT[- ]?[A-Z0-9\-]+\b",
-    r"\b[A-Z]{2,8}-[A-Z0-9]{3,30}\b",
-    r"\b\d{8,20}\b",
-]
+    return ""
 
+def find_keywords(desc):
+    keywords = [
+        "FW",
+        "ISP",
+        "INTERNET",
+        "VERIZON",
+        "CLINK",
+        "LUMEN",
+        "WAN",
+        "PRISMA",
+        "VPN",
+        "B2B",
+        "DMZ",
+        "PA",
+    ]
 
-def extract_circuit_ids(text):
+    desc_u = desc.upper()
+    found = []
 
-    ids = set()
+    for keyword in keywords:
+        if re.search(rf"\b{re.escape(keyword)}\b", desc_u):
+            found.append(keyword)
 
-    for pattern in CIRCUIT_PATTERNS:
+    return ",".join(found)
 
-        matches = re.findall(
-            pattern,
-            text,
+def circuit_type(desc):
+    desc_u = desc.upper()
+
+    if "INTERNET" in desc_u:
+        return "Internet"
+
+    if re.search(r"\bFW\b", desc_u):
+        return "Firewall"
+
+    if re.search(r"\bWAN\b", desc_u):
+        return "WAN"
+
+    return ""
+
+def directly_attached(desc):
+    match = re.match(r"^\s*(\S+)", desc)
+    return match.group(1) if match else ""
+
+def parse_interface_status(output):
+    """
+    Parses:
+    show interface status
+
+    Typical format:
+    Port      Name      Status       Vlan   Duplex Speed Type
+    Eth1/1              connected    10     full   10G   ...
+    """
+    results = {}
+
+    for line in output.splitlines():
+        match = re.match(
+            rf"^\s*(?P<interface>{INTERFACE_RE})\s+"
+            r"(?:(?P<name>.*?)\s+)?"
+            r"(?P<status>connected|notconnect|disabled|suspended|"
+            r"err-disabled|xcvrd|xcvr|unknown)\s+"
+            r"(?P<vlan>\S+)",
+            line,
             re.IGNORECASE,
         )
 
-        ids.update(matches)
+        if not match:
+            continue
 
-    return ",".join(sorted(ids))
+        results[match.group("interface")] = {
+            "status": match.group("status"),
+            "vlan": match.group("vlan"),
+        }
 
+    return results
 
-###############################################################################
-# KEYWORD DETECTION
-###############################################################################
+def parse_interface_description(output):
+    interfaces = {}
 
-def get_keywords(text):
+    for line in output.splitlines():
+        if not re.match(rf"^\s*{INTERFACE_RE}\b", line):
+            continue
 
-    keywords = []
+        parts = re.split(r"\s{2,}", line.strip())
 
-    text = text.lower()
+        if len(parts) < 3:
+            continue
 
-    if "internet" in text:
-        keywords.append("INTERNET")
+        iface = parts[0]
+        admin = parts[1]
+        oper = parts[2]
+        desc = parts[3] if len(parts) >= 4 else ""
 
-    if "isp" in text:
-        keywords.append("ISP")
+        interfaces[iface] = {
+            "admin": admin,
+            "oper": oper,
+            "desc": desc,
+        }
 
-    if "fw" in text:
-        keywords.append("FW")
+    return interfaces
 
-    if "firewall" in text:
-        keywords.append("FW")
+def normalize_interface_name(interface):
+    replacements = {
+        "Ethernet": "Eth",
+        "GigabitEthernet": "Gi",
+        "TenGigabitEthernet": "Te",
+        "Port-channel": "Po",
+    }
 
-    if "verizon" in text:
-        keywords.append("VERIZON")
+    for long_name, short_name in replacements.items():
+        if interface.startswith(long_name):
+            return interface.replace(long_name, short_name, 1)
 
-    if "vrt" in text:
-        keywords.append("VERIZON")
+    return interface
 
-    if "vpn" in text:
-        keywords.append("VPN")
+def parse_interface_switchport(output):
+    """
+    Parses:
+    show interface switchport
 
-    return ",".join(sorted(set(keywords)))
+    Extracts operational mode, native VLAN, access VLAN,
+    and allowed VLANs for each interface.
+    """
+    results = {}
+    current_interface = None
 
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
 
-###############################################################################
-# CIRCUIT TYPE
-###############################################################################
+        interface_match = re.match(
+            rf"^Name:\s*(?P<interface>{INTERFACE_RE})",
+            line,
+            re.IGNORECASE,
+        )
 
-def determine_circuit_type(text):
+        if interface_match:
+            current_interface = normalize_interface_name(
+                interface_match.group("interface")
+            )
+            results[current_interface] = {
+                "mode": "",
+                "native_vlan": "",
+                "allowed_vlans": "",
+            }
+            continue
 
-    text = text.lower()
+        if not current_interface:
+            continue
 
-    if "verizon" in text:
-        return "Internet"
+        mode_match = re.match(
+            r"^Operational Mode:\s*(.+)$",
+            line,
+            re.IGNORECASE,
+        )
 
-    if "internet" in text:
-        return "Internet"
+        if mode_match:
+            results[current_interface]["mode"] = mode_match.group(1).strip()
+            continue
 
-    if "isp" in text:
-        return "Internet"
+        access_vlan_match = re.match(
+            r"^Access Mode VLAN:\s*(\S+)",
+            line,
+            re.IGNORECASE,
+        )
 
-    if "fw" in text:
-        return "Firewall"
+        if access_vlan_match:
+            results[current_interface]["native_vlan"] = (
+                access_vlan_match.group(1)
+            )
+            continue
 
-    if "firewall" in text:
-        return "Firewall"
+        native_vlan_match = re.match(
+            r"^Trunking Native Mode VLAN:\s*(\S+)",
+            line,
+            re.IGNORECASE,
+        )
 
-    if "vpn" in text:
-        return "VPN"
+        if native_vlan_match:
+            results[current_interface]["native_vlan"] = (
+                native_vlan_match.group(1)
+            )
+            continue
 
-    return "Unknown"
+        allowed_vlan_match = re.match(
+            r"^Trunking VLANs Enabled:\s*(.+)$",
+            line,
+            re.IGNORECASE,
+        )
 
+        if allowed_vlan_match:
+            results[current_interface]["allowed_vlans"] = (
+                allowed_vlan_match.group(1).strip()
+            )
 
-###############################################################################
-# NOTES
-###############################################################################
+    return results
 
-def build_notes(
-    interface_status,
-    vendor,
-    circuit_ids,
-):
+def parse_mac_table(output):
+    """
+    Parses MAC addresses learned on Eth, Gi, Te, and Po interfaces.
+    """
+    mac_count = {}
 
+    for line in output.splitlines():
+        mac_match = re.search(
+            r"\b[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}\b",
+            line,
+            re.IGNORECASE,
+        )
+
+        if not mac_match:
+            continue
+
+        interface_match = re.search(
+            rf"\b(?P<interface>{INTERFACE_RE})\b",
+            line,
+            re.IGNORECASE,
+        )
+
+        if not interface_match:
+            continue
+
+        interface = normalize_interface_name(interface_match.group("interface"))
+        mac_count[interface] = mac_count.get(interface, 0) + 1
+
+    return mac_count
+
+def build_notes(row):
     notes = []
 
-    if interface_status.lower() not in [
-        "connected",
-        "up",
-    ]:
+    if row["Operational Status"].lower() == "down":
         notes.append("Interface Down")
 
-    if vendor == "Unknown":
+    if row["Circuit Vendor"] == "Unknown":
         notes.append("Vendor Unknown")
 
-    if not circuit_ids:
+    if not row["Circuit IDs"]:
         notes.append("Circuit ID Missing")
+
+    if row["MAC Count"] == 0:
+        notes.append("No MAC Addresses Learned")
 
     return "; ".join(notes)
 
-
-###############################################################################
-# GET INTERFACE DESCRIPTIONS
-###############################################################################
-
-def get_descriptions(output):
-
-    descriptions = {}
-
-    for line in output.splitlines():
-
-        cols = line.split()
-
-        if len(cols) < 4:
-            continue
-
-        interface = cols[0]
-
-        description = " ".join(cols[3:])
-
-        descriptions[interface] = description
-
-    return descriptions
-
-
-###############################################################################
-# GET CDP NEIGHBORS
-###############################################################################
-
-def get_neighbors(output):
-
-    neighbors = {}
-
-    neighbor = ""
-
-    for line in output.splitlines():
-
-        if "Device ID:" in line:
-
-            neighbor = line.split(
-                "Device ID:"
-            )[1].strip()
-
-        if "Interface:" in line:
-
-            match = re.search(
-                r"Interface:\s*([^,]+)",
-                line,
-            )
-
-            if match:
-
-                local_int = match.group(1).strip()
-
-                neighbors[local_int] = neighbor
-
-    return neighbors
-
-
-###############################################################################
-# PROCESS DEVICE
-###############################################################################
-
-def process_device(
-    hostname,
-    username,
-    password,
-):
-
-    results = []
+def main():
+    username = input("Username: ")
+    password = getpass.getpass("Password: ")
+    hostname = input("Switch Hostname/IP: ")
 
     device = {
         "device_type": "cisco_nxos",
         "host": hostname,
         "username": username,
         "password": password,
+        "fast_cli": False,
     }
 
-    try:
+    conn = None
 
+    try:
+        print(f"\nConnecting to {hostname}...\n")
         conn = ConnectHandler(**device)
 
-        print(f"[+] Connected to {hostname}")
-
-        status_output = conn.send_command(
-            "show interface status"
+        show_desc = conn.send_command(
+            "show interface description",
+            read_timeout=60,
         )
 
-        desc_output = conn.send_command(
-            "show interface description"
+        show_status = conn.send_command(
+            "show interface status",
+            read_timeout=60,
         )
 
-        cdp_output = conn.send_command(
-            "show cdp neighbors detail"
+        show_switchport = conn.send_command(
+            "show interface switchport",
+            read_timeout=60,
         )
 
-        desc_map = get_descriptions(
-            desc_output
+        show_mac = conn.send_command(
+            "show mac address-table",
+            read_timeout=60,
         )
 
-        neighbor_map = get_neighbors(
-            cdp_output
-        )
+        mgmt_ip = conn.host
 
-        for line in status_output.splitlines():
+    except NetmikoAuthenticationException:
+        print("Authentication failed.", file=sys.stderr)
+        sys.exit(1)
 
-            if not line.startswith("Eth"):
-                continue
-
-            cols = line.split()
-
-            if len(cols) < 3:
-                continue
-
-            interface = cols[0]
-
-            interface_status = cols[2]
-
-            vlan = ""
-
-            if len(cols) >= 4:
-                vlan = cols[3]
-
-            description = desc_map.get(
-                interface,
-                ""
-            )
-
-            neighbor = neighbor_map.get(
-                interface,
-                ""
-            )
-
-            search_text = (
-                description
-                + " "
-                + neighbor
-            )
-
-            vendor = detect_vendor(
-                search_text
-            )
-
-            circuit_ids = extract_circuit_ids(
-                search_text
-            )
-
-            keywords = get_keywords(
-                search_text
-            )
-
-            circuit_type = determine_circuit_type(
-                search_text
-            )
-
-            notes = build_notes(
-                interface_status,
-                vendor,
-                circuit_ids,
-            )
-
-            results.append([
-                hostname,
-                hostname,
-                interface,
-                interface_status,
-                "",
-                "",
-                vlan,
-                "",
-                "",
-                "",
-                vendor,
-                circuit_ids,
-                circuit_type,
-                "YES",
-                keywords,
-                description,
-                notes,
-            ])
-
-        conn.disconnect()
+    except NetmikoTimeoutException:
+        print("Connection timed out.", file=sys.stderr)
+        sys.exit(1)
 
     except Exception as exc:
+        print(f"Connection or command failure: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-        print(
-            f"[ERROR] {hostname}: {exc}"
+    finally:
+        if conn:
+            conn.disconnect()
+
+    interfaces = parse_interface_description(show_desc)
+    status_data = parse_interface_status(show_status)
+    switchport_data = parse_interface_switchport(show_switchport)
+    mac_data = parse_mac_table(show_mac)
+
+    fields = [
+        "Device",
+        "Management IP",
+        "Interface",
+        "Interface Status",
+        "Admin Status",
+        "Operational Status",
+        "VLAN",
+        "Mode",
+        "Native VLAN",
+        "Allowed VLANs",
+        "Circuit Vendor",
+        "Circuit IDs",
+        "Circuit Type",
+        "Circuit Directly Attached",
+        "Matched Keywords",
+        "Description",
+        "MAC Count",
+        "Notes",
+    ]
+
+    rows = []
+
+    for iface, data in interfaces.items():
+        desc = data["desc"]
+        switchport = switchport_data.get(
+            iface,
+            {
+                "mode": "",
+                "native_vlan": "",
+                "allowed_vlans": "",
+            },
         )
 
-    return results
+        row = {
+            "Device": hostname,
+            "Management IP": mgmt_ip,
+            "Interface": iface,
+            "Interface Status": status_data.get(iface, {}).get("status", ""),
+            "Admin Status": data["admin"],
+            "Operational Status": data["oper"],
+            "VLAN": status_data.get(iface, {}).get("vlan", ""),
+            "Mode": switchport["mode"],
+            "Native VLAN": switchport["native_vlan"],
+            "Allowed VLANs": switchport["allowed_vlans"],
+            "Circuit Vendor": find_vendor(desc),
+            "Circuit IDs": find_circuit_id(desc),
+            "Circuit Type": circuit_type(desc),
+            "Circuit Directly Attached": directly_attached(desc),
+            "Matched Keywords": find_keywords(desc),
+            "Description": desc,
+            "MAC Count": mac_data.get(iface, 0),
+        }
 
+        row["Notes"] = build_notes(row)
+        rows.append(row)
 
-###############################################################################
-# MAIN
-###############################################################################
+    with open(CSV_FILE, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fields)
+        writer.writeheader()
+        writer.writerows(rows)
 
-def main():
-
-    hosts = input(
-        "Switches (comma separated): "
-    )
-
-    username = input(
-        "Username: "
-    )
-
-    password = getpass.getpass(
-        "Password: "
-    )
-
-    all_results = []
-
-    for host in hosts.split(","):
-
-        host = host.strip()
-
-        if not host:
-            continue
-
-        all_results.extend(
-            process_device(
-                host,
-                username,
-                password,
-            )
-        )
-
-    with open(
-        OUTPUT_FILE,
-        "w",
-        newline="",
-        encoding="utf-8",
-    ) as csvfile:
-
-        writer = csv.writer(csvfile)
-
-        writer.writerow([
-            "Device",
-            "Management IP",
-            "Interface",
-            "Interface Status",
-            "Admin Status",
-            "Operational Status",
-            "VLAN",
-            "Mode",
-            "Native VLAN",
-            "Allowed VLANs",
-            "Circuit Vendor",
-            "Circuit IDs",
-            "Circuit Type",
-            "Circuit Directly Attached",
-            "Matched Keywords",
-            "Description",
-            "Notes",
-        ])
-
-        writer.writerows(
-            all_results
-        )
-
-    print()
-    print("=" * 60)
-    print("Circuit Inventory Complete")
-    print("=" * 60)
-    print(f"Output File : {OUTPUT_FILE}")
-    print(f"Records     : {len(all_results)}")
-    print("=" * 60)
-
+    print(f"\nCSV written to {CSV_FILE}")
+    print(f"Interfaces processed: {len(rows)}")
 
 if __name__ == "__main__":
     main()
