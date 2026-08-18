@@ -264,6 +264,24 @@ def is_asr_device(host):
     return host.strip().upper().startswith("ASR")
 
 
+def get_device_profile(host, platform):
+    platform = platform.lower().strip()
+
+    if platform == "ios":
+        return "cisco_ios", False
+
+    if platform == "asr":
+        return "cisco_ios", True
+
+    if platform == "nxos":
+        return "cisco_nxos", False
+
+    if is_asr_device(host):
+        return "cisco_ios", True
+
+    return "cisco_nxos", False
+
+
 def parse_asr_interface_description(line):
     parts = line.strip().split(None, 3)
 
@@ -298,6 +316,14 @@ def main():
         "Enter device names (comma separated): "
     ).strip()
 
+    platform = input(
+        "Platform [auto/nxos/ios/asr] (default: auto): "
+    ).strip().lower() or "auto"
+
+    if platform not in ["auto", "nxos", "ios", "asr"]:
+        print(f"Unknown platform '{platform}'. Using auto detection.")
+        platform = "auto"
+
     username = input("Username: ").strip()
     password = getpass("Password: ")
 
@@ -316,8 +342,10 @@ def main():
         try:
             print(f"Connecting to {host} ...")
 
-            asr_device = is_asr_device(host)
-            device_type = "cisco_ios" if asr_device else "cisco_nxos"
+            device_type, description_only = get_device_profile(
+                host,
+                platform
+            )
 
             conn = connect_device(
                 host,
@@ -329,7 +357,7 @@ def main():
             conn.disable_paging()
             mgmt_ip = resolve_ip(host)
 
-            if asr_device:
+            if description_only:
                 interface_output = conn.send_command(
                     "show interfaces description",
                     read_timeout=120
@@ -353,7 +381,9 @@ def main():
                 continue
 
             interface_output = conn.send_command(
-                "show interface status",
+                "show interfaces status"
+                if device_type == "cisco_ios"
+                else "show interface status",
                 read_timeout=120
             )
 
