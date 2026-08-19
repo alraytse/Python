@@ -135,6 +135,31 @@ def normalize_interface_name(interface):
     return interface
 
 
+VALID_OPER_STATES = {
+    "up",
+    "down",
+    "admin-down",
+    "unknown",
+    "testing",
+}
+
+
+def normalize_operational_status(status):
+    """Return a valid operational state instead of a speed/VLAN token."""
+    normalized = (status or "").lower().strip()
+
+    if normalized in VALID_OPER_STATES:
+        return normalized
+
+    if normalized:
+        logger.warning(
+            "Ignoring invalid operational status value %r",
+            status,
+        )
+
+    return "unknown"
+
+
 def display_interface_status(interface, status, fallback_status=""):
     """Format port-channel state and prevent blank status values."""
     status = (status or fallback_status or "unknown").lower().strip()
@@ -507,10 +532,11 @@ def collect_host(hostname, username, password):
         mac_vendor = "; ".join(sorted(mac_vendors)) if mac_vendors else "Unknown"
         device_type = classify_device(desc, mac_vendors)
         raw_interface_status = status_data.get(iface, {}).get("status", "")
+        operational_status = normalize_operational_status(data.get("oper", ""))
         interface_status = display_interface_status(
             iface,
             raw_interface_status,
-            data.get("oper", ""),
+            operational_status,
         )
 
         row = {
@@ -519,7 +545,7 @@ def collect_host(hostname, username, password):
             "Interface": iface,
             "Interface Status": interface_status,
             "Admin Status": data["admin"],
-            "Operational Status": data["oper"],
+            "Operational Status": operational_status,
             "VLAN": status_data.get(iface, {}).get("vlan", ""),
             "Mode": switchport["mode"],
             "Native VLAN": switchport["native_vlan"],
