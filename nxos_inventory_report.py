@@ -33,8 +33,9 @@ CSV_FILE = "inventory_report.csv"
 logger = logging.getLogger(__name__)
 
 INTERFACE_RE = (
-    r"(?:Eth|Gi|Te|Po|Ethernet|GigabitEthernet|TenGigabitEthernet|"
-    r"Port-channel)\S+"
+    r"(?:(?:Eth|Gi|Te|Po)\d+(?:/\d+)*|"
+    r"(?:Ethernet|GigabitEthernet|TenGigabitEthernet|Port-channel)"
+    r"\d+(?:/\d+)*)"
 )
 
 
