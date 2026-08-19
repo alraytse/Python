@@ -162,6 +162,7 @@ def normalize_operational_status(status, fallback_status=""):
         "sfpabsent": "down",
         "inactive": "down",
         "link-down": "down",
+        "channel-down": "down",
         "admin-down": "shutdown",
         "testing": "testing",
         "unknown": "unknown",
@@ -201,6 +202,7 @@ def display_interface_status(interface, status, fallback_status=""):
             "notconnect",
             "suspended",
             "err-disabled",
+            "channel-down",
             "unknown",
         }:
             return f"{interface}/down"
@@ -217,7 +219,7 @@ def parse_interface_status(output):
             rf"(?:(?P<name>.*?)\s+)?"
             r"(?P<status>connected|notconnect|disabled|suspended|"
             r"err-disabled|xcvrd|xcvr|xcvrAbsn|xcvrAbsent|"
-            r"sfpAbsent|inactive|link-down|shutdown|unknown)\s+"
+            r"sfpAbsent|inactive|link-down|channel-down|shutdown|unknown)\s+"
             r"(?P<vlan>\S+)",
             line,
             re.IGNORECASE,
