@@ -163,6 +163,8 @@ def normalize_operational_status(status, fallback_status=""):
         "inactive": "down",
         "link-down": "down",
         "channel-down": "down",
+        "channeldown": "down",
+        "channeldo": "down",
         "admin-down": "shutdown",
         "testing": "testing",
         "unknown": "unknown",
@@ -207,6 +209,9 @@ def display_interface_status(interface, status, fallback_status=""):
         }:
             return f"{interface}/down"
 
+    if status in {"channeldo", "channeldown"}:
+        return "down"
+
     return status or "unknown"
 
 
@@ -216,7 +221,7 @@ def parse_interface_status(output):
     status_pattern = (
         r"connected|notconnect|notconnec|disabled|suspended|"
         r"err-disabled|xcvrd|xcvr|xcvrAbsn|xcvrAbsent|sfpAbsent|"
-        r"inactive|link-down|linkDown|channel-down|channelDown|"
+        r"inactive|link-down|linkDown|channel-down|channelDown|channelDo|"
         r"noOperMem|out-of-service|shutdown|unknown|up|down"
     )
 
