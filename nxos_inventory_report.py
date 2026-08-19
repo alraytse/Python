@@ -211,28 +211,24 @@ def display_interface_status(interface, status, fallback_status=""):
 
 
 def parse_interface_status(output):
+    """Parse NX-OS show interface status output across column variations."""
     results = {}
+    status_pattern = (
+        r"connected|notconnect|notconnec|disabled|suspended|"
+        r"err-disabled|xcvrd|xcvr|xcvrAbsn|xcvrAbsent|sfpAbsent|"
+        r"inactive|link-down|linkDown|channel-down|channelDown|"
+        r"noOperMem|out-of-service|shutdown|unknown|up|down"
+    )
 
     for line_number, line in enumerate(output.splitlines(), start=1):
-        match = re.match(
-            rf"^\s*(?P<interface>{INTERFACE_RE})\s+"
-            rf"(?:(?P<name>.*?)\s+)?"
-            r"(?P<status>connected|notconnect|disabled|suspended|"
-            r"err-disabled|xcvrd|xcvr|xcvrAbsn|xcvrAbsent|"
-            r"sfpAbsent|inactive|link-down|channel-down|shutdown|unknown)\s+"
-            r"(?P<vlan>\S+)",
+        interface_match = re.match(
+            rf"^\s*(?P<interface>{INTERFACE_RE})(?=\s|$)",
             line,
             re.IGNORECASE,
         )
 
-        if not match:
-            if re.match(rf"^\s*{INTERFACE_RE}\b", line):
-                logger.warning(
-                    "Unable to parse interface status line %d: %s",
-                    line_number,
-                    line.strip(),
-                )
-            elif line.strip():
+        if not interface_match:
+            if line.strip():
                 logger.debug(
                     "Ignoring non-interface status line %d: %s",
                     line_number,
@@ -240,9 +236,27 @@ def parse_interface_status(output):
                 )
             continue
 
-        interface = normalize_interface_name(match.group("interface"))
-        status = match.group("status")
-        vlan = match.group("vlan")
+        interface = normalize_interface_name(interface_match.group("interface"))
+        remainder = line[interface_match.end():]
+        status_match = re.search(
+            rf"\b(?P<status>{status_pattern})\b",
+            remainder,
+            re.IGNORECASE,
+        )
+
+        if not status_match:
+            logger.warning(
+                "Unable to parse status token on line %d: %s",
+                line_number,
+                line.strip(),
+            )
+            continue
+
+        status = status_match.group("status")
+        after_status = remainder[status_match.end():]
+        vlan_match = re.match(r"\s+(?P<vlan>\S+)", after_status)
+        vlan = vlan_match.group("vlan") if vlan_match else ""
+
         results[interface] = {
             "status": status,
             "vlan": vlan,
@@ -255,7 +269,6 @@ def parse_interface_status(output):
         )
 
     return results
-
 
 def parse_port_channel_summary(output):
     """Parse NX-OS port-channel flags such as Po1(SU) and Po1(D)."""
