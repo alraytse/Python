@@ -190,6 +190,47 @@ def normalize_operational_status(status, fallback_status=""):
     return "unknown"
 
 
+def normalize_admin_status(status, fallback_status=""):
+    """Derive administrative state from show interface status."""
+    normalized = (status or "").lower().strip()
+
+    if normalized in {"disabled", "shutdown", "admin-down"}:
+        return "admin down"
+
+    if normalized in {
+        "connected",
+        "up",
+        "down",
+        "notconnect",
+        "notconnec",
+        "suspended",
+        "err-disabled",
+        "xcvrd",
+        "xcvr",
+        "xcvrabsn",
+        "xcvrabsent",
+        "sfpabsent",
+        "inactive",
+        "link-down",
+        "channeldown",
+        "channeldo",
+        "channel-down",
+        "noopermem",
+        "out-of-service",
+        "testing",
+        "unknown",
+    }:
+        return "up"
+
+    fallback = (fallback_status or "").lower().strip()
+    if fallback in {"admin down", "admin-down", "shutdown"}:
+        return "admin down"
+    if fallback in {"up", "down"}:
+        return fallback
+
+    return "unknown"
+
+
 def display_interface_status(interface, status, fallback_status=""):
     """Format port-channel state and prevent blank status values."""
     status = (status or fallback_status or "unknown").lower().strip()
@@ -623,6 +664,10 @@ def collect_host(hostname, username, password):
         if iface.startswith("Po") and iface in port_channel_data:
             raw_interface_status = port_channel_data[iface]["status"]
 
+        admin_status = normalize_admin_status(
+            raw_interface_status,
+            data.get("admin", ""),
+        )
         operational_status = normalize_operational_status(
             raw_interface_status,
             data.get("oper", ""),
@@ -638,7 +683,7 @@ def collect_host(hostname, username, password):
             "Management IP": mgmt_ip,
             "Interface": iface,
             "Interface Status": interface_status,
-            "Admin Status": data["admin"],
+            "Admin Status": admin_status,
             "Operational Status": operational_status,
             "VLAN": status_data.get(iface, {}).get("vlan", ""),
             "Mode": switchport["mode"],
