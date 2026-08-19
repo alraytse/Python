@@ -205,12 +205,14 @@ def display_interface_status(interface, status, fallback_status=""):
             "suspended",
             "err-disabled",
             "channel-down",
+            "channeldown",
+            "channeldo",
             "unknown",
         }:
             return f"{interface}/down"
 
     if status in {"channeldo", "channeldown"}:
-        return "down"
+        return "ChannelDown"
 
     return status or "unknown"
 
