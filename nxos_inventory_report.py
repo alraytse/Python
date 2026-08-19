@@ -257,6 +257,38 @@ def parse_interface_status(output):
     return results
 
 
+def parse_port_channel_summary(output):
+    """Parse NX-OS port-channel flags such as Po1(SU) and Po1(D)."""
+    results = {}
+
+    for line_number, line in enumerate(output.splitlines(), start=1):
+        match = re.search(
+            r"\b(?P<interface>Po\d+)\((?P<flags>[^)]+)\)",
+            line,
+            re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        interface = normalize_interface_name(match.group("interface"))
+        flags = match.group("flags").upper()
+        status = "down" if "D" in flags else "up" if "U" in flags else "unknown"
+
+        results[interface] = {
+            "status": status,
+            "flags": flags,
+        }
+        logger.debug(
+            "Parsed port-channel summary: %s flags=%s status=%s",
+            interface,
+            flags,
+            status,
+        )
+
+    return results
+
+
 def parse_interface_description(output):
     interfaces = {}
 
@@ -483,6 +515,10 @@ def collect_host(hostname, username, password):
             "show interface status",
             read_timeout=60,
         )
+        show_port_channel = conn.send_command(
+            "show port-channel summary",
+            read_timeout=60,
+        )
         show_switchport = conn.send_command(
             "show interface switchport",
             read_timeout=60,
@@ -515,6 +551,7 @@ def collect_host(hostname, username, password):
 
     interfaces = parse_interface_description(show_desc)
     status_data = parse_interface_status(show_status)
+    port_channel_data = parse_port_channel_summary(show_port_channel)
     switchport_data = parse_interface_switchport(show_switchport)
     mac_data = parse_mac_table(show_mac)
 
@@ -559,6 +596,10 @@ def collect_host(hostname, username, password):
         mac_vendor = "; ".join(sorted(mac_vendors)) if mac_vendors else "Unknown"
         device_type = classify_device(desc, mac_vendors)
         raw_interface_status = status_data.get(iface, {}).get("status", "")
+
+        if iface.startswith("Po") and iface in port_channel_data:
+            raw_interface_status = port_channel_data[iface]["status"]
+
         operational_status = normalize_operational_status(
             raw_interface_status,
             data.get("oper", ""),
