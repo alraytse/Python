@@ -151,6 +151,7 @@ def normalize_operational_status(status, fallback_status=""):
         "connected": "up",
         "up": "up",
         "notconnect": "down",
+        "notconnec": "down",
         "down": "down",
         "disabled": "shutdown",
         "shutdown": "shutdown",
@@ -203,6 +204,7 @@ def display_interface_status(interface, status, fallback_status=""):
         if status in {
             "down",
             "notconnect",
+            "notconnec",
             "suspended",
             "err-disabled",
             "channel-down",
