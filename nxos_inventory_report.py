@@ -144,17 +144,42 @@ VALID_OPER_STATES = {
 }
 
 
-def normalize_operational_status(status):
-    """Return a valid operational state instead of a speed/VLAN token."""
+def normalize_operational_status(status, fallback_status=""):
+    """Convert show-interface-status values into operational states."""
+    status_map = {
+        "connected": "up",
+        "up": "up",
+        "notconnect": "down",
+        "down": "down",
+        "disabled": "shutdown",
+        "shutdown": "shutdown",
+        "suspended": "down",
+        "err-disabled": "down",
+        "xcvrd": "down",
+        "xcvr": "down",
+        "xcvrabsn": "down",
+        "xcvrabsent": "down",
+        "sfpabsent": "down",
+        "inactive": "down",
+        "link-down": "down",
+        "admin-down": "shutdown",
+        "testing": "testing",
+        "unknown": "unknown",
+    }
+
     normalized = (status or "").lower().strip()
+    if normalized in status_map:
+        return status_map[normalized]
 
-    if normalized in VALID_OPER_STATES:
-        return normalized
+    fallback = (fallback_status or "").lower().strip()
+    if fallback in VALID_OPER_STATES:
+        return fallback
 
-    if normalized:
+    if normalized or fallback:
         logger.warning(
-            "Ignoring invalid operational status value %r",
+            "Ignoring invalid operational status value %r; fallback=%r",
             status,
+            fallback_status,
         )
 
     return "unknown"
@@ -418,7 +443,7 @@ def classify_device(description, vendors):
 def build_notes(row):
     notes = []
 
-    if row["Operational Status"].lower() == "down":
+    if row["Operational Status"].lower() in {"down", "shutdown"}:
         notes.append("Interface Down")
 
     if row["Circuit Vendor"] == "Unknown":
@@ -532,7 +557,10 @@ def collect_host(hostname, username, password):
         mac_vendor = "; ".join(sorted(mac_vendors)) if mac_vendors else "Unknown"
         device_type = classify_device(desc, mac_vendors)
         raw_interface_status = status_data.get(iface, {}).get("status", "")
-        operational_status = normalize_operational_status(data.get("oper", ""))
+        operational_status = normalize_operational_status(
+            raw_interface_status,
+            data.get("oper", ""),
+        )
         interface_status = display_interface_status(
             iface,
             raw_interface_status,
