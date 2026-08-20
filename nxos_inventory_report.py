@@ -685,6 +685,16 @@ def collect_host(hostname, username, password):
             "Interface Status": interface_status,
             "Admin Status": admin_status,
             "Operational Status": operational_status,
+            "Decom/Scream Test Candidate": (
+                "Yes"
+                if operational_status in {"down", "shutdown"}
+                else "No"
+            ),
+            "Score Rate": (
+                1
+                if operational_status in {"down", "shutdown"}
+                else 0
+            ),
             "VLAN": status_data.get(iface, {}).get("vlan", ""),
             "Mode": switchport["mode"],
             "Native VLAN": switchport["native_vlan"],
@@ -745,6 +755,8 @@ def main():
         "Interface Status",
         "Admin Status",
         "Operational Status",
+        "Decom/Scream Test Candidate",
+        "Score Rate",
         "VLAN",
         "Mode",
         "Native VLAN",
