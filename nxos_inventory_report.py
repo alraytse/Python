@@ -809,14 +809,28 @@ def main():
     for host_rows in rows_by_host:
         all_rows.extend(host_rows or [])
 
+    down_not_shutdown = [
+        (row["Device"], row["Interface"])
+        for row in all_rows
+        if row["Operational Status"].lower() == "down"
+        and row["Admin Status"].lower() not in {"admin down", "shutdown"}
+    ]
+
     with open(CSV_FILE, "w", newline="", encoding="utf-8") as file:
         writer = csv.DictWriter(file, fieldnames=fields)
         writer.writeheader()
         writer.writerows(all_rows)
 
+        summary_writer = csv.writer(file)
+        summary_writer.writerow([])
+        summary_writer.writerow(["Down Ports Not Shutdown"])
+        summary_writer.writerow(["Switch Name", "Port"])
+        summary_writer.writerows(down_not_shutdown)
+
     print(f"\nCSV written to {CSV_FILE}")
     print(f"Devices processed: {len(hostnames)}")
     print(f"Interfaces processed: {len(all_rows)}")
+    print(f"Down ports not shutdown: {len(down_not_shutdown)}")
 
 
 if __name__ == "__main__":
