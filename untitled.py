@@ -570,6 +570,25 @@ def build_notes(row):
 
     return "; ".join(notes)
 
+def shutdown_reason(row):
+    """Explain why an interface was selected as a shutdown candidate."""
+    operational_status = row["Operational Status"].strip().lower()
+    mac_count = row["MAC Count"]
+
+    if operational_status == "shutdown":
+        return "Interface is already shutdown"
+
+    if operational_status == "down":
+        return "Interface is operationally down"
+
+    if operational_status == "up" and mac_count in {1, 2}:
+        return (
+            f"Interface is up with {mac_count} learned "
+            "MAC address(es)"
+        )
+
+    return "Decom/Scream Test candidate"
+
 def collect_host(hostname, username, password):
     device = {
         "device_type": "cisco_nxos",
@@ -873,7 +892,14 @@ def main():
     for host_rows in rows_by_host:
         all_rows.extend(host_rows or [])
 
-    # Exclude shutdown interfaces from the entire CSV report.
+    # Preserve candidates for the separate shutdown report.
+    shutdown_report_rows = [
+        row
+        for row in all_rows
+        if row["Decom/Scream Test Candidate"] == "Yes"
+    ]
+
+    # Exclude shutdown interfaces from the main inventory report.
     all_rows = [
         row
         for row in all_rows
@@ -909,10 +935,56 @@ def main():
         summary_writer.writerow(["Switch Name", "Port"])
         summary_writer.writerows(down_not_shutdown)
 
+        summary_writer.writerow([])
+        summary_writer.writerow(
+            ["Interfaces Scheduled for Shutdown"]
+        )
+
+        summary_writer.writerow(
+            [
+                "Switch Name",
+                "Management IP",
+                "Interface",
+                "Interface Status",
+                "Admin Status",
+                "Operational Status",
+                "MAC Count",
+                "MAC Addresses",
+                "Description",
+                "Shutdown Reason",
+            ]
+        )
+
+        for row in sorted(
+            shutdown_report_rows,
+            key=lambda item: (
+                item["Device"],
+                item["Interface"],
+            ),
+        ):
+            summary_writer.writerow(
+                [
+                    row["Device"],
+                    row["Management IP"],
+                    row["Interface"],
+                    row["Interface Status"],
+                    row["Admin Status"],
+                    row["Operational Status"],
+                    row["MAC Count"],
+                    row["MAC Addresses"],
+                    row["Description"],
+                    shutdown_reason(row),
+                ]
+            )
+
     print(f"\nCSV written to {CSV_FILE}")
     print(f"Devices processed: {len(hostnames)}")
     print(f"Interfaces processed: {len(all_rows)}")
     print(f"Down ports not shutdown: {len(down_not_shutdown)}")
+    print(
+        "Interfaces scheduled for shutdown: "
+        f"{len(shutdown_report_rows)}"
+    )
 
 if __name__ == "__main__":
     main()
