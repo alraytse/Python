@@ -6,7 +6,6 @@ import getpass
 import logging
 import re
 import sys
-from collections import Counter
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -22,6 +21,7 @@ except ImportError:
     MacLookup = None
 
 _MAC_LOOKUP = None
+
 if MacLookup is not None:
     try:
         _MAC_LOOKUP = MacLookup()
@@ -67,6 +67,7 @@ def find_circuit_id(desc):
 
     for pattern in patterns:
         match = re.search(pattern, desc, re.IGNORECASE)
+
         if match:
             return match.group(1)
 
@@ -165,10 +166,12 @@ def normalize_operational_status(status, fallback_status=""):
     }
 
     normalized = (status or "").lower().strip()
+
     if normalized in status_map:
         return status_map[normalized]
 
     fallback = (fallback_status or "").lower().strip()
+
     if fallback in VALID_OPER_STATES:
         return fallback
 
@@ -214,8 +217,10 @@ def normalize_admin_status(status, fallback_status=""):
         return "up"
 
     fallback = (fallback_status or "").lower().strip()
+
     if fallback in {"admin down", "admin-down", "shutdown"}:
         return "admin down"
+
     if fallback in {"up", "down"}:
         return fallback
 
@@ -251,8 +256,9 @@ def display_interface_status(interface, status, fallback_status=""):
     return status or "unknown"
 
 def parse_interface_status(output):
-    """Parse NX-OS show interface status output across column variations."""
+    """Parse NX-OS show interface status output."""
     results = {}
+
     status_pattern = (
         r"connected|notconnect|notconnec|disabled|suspended|"
         r"err-disabled|xcvrd|xcvr|xcvrAbsn|xcvrAbsent|sfpAbsent|"
@@ -276,8 +282,12 @@ def parse_interface_status(output):
                 )
             continue
 
-        interface = normalize_interface_name(interface_match.group("interface"))
+        interface = normalize_interface_name(
+            interface_match.group("interface")
+        )
+
         remainder = line[interface_match.end():]
+
         status_match = re.search(
             rf"\b(?P<status>{status_pattern})\b",
             remainder,
@@ -294,6 +304,7 @@ def parse_interface_status(output):
 
         status = status_match.group("status")
         after_status = remainder[status_match.end():]
+
         vlan_match = re.match(r"\s+(?P<vlan>\S+)", after_status)
         vlan = vlan_match.group("vlan") if vlan_match else ""
 
@@ -327,7 +338,14 @@ def parse_port_channel_summary(output):
 
         interface = normalize_interface_name(match.group("interface"))
         flags = match.group("flags").upper()
-        status = "down" if "D" in flags else "up" if "U" in flags else "unknown"
+
+        status = (
+            "down"
+            if "D" in flags
+            else "up"
+            if "U" in flags
+            else "unknown"
+        )
 
         results[interface] = {
             "status": status,
@@ -385,11 +403,13 @@ def parse_interface_switchport(output):
             current_interface = normalize_interface_name(
                 interface_match.group("interface")
             )
+
             results[current_interface] = {
                 "mode": "",
                 "native_vlan": "",
                 "allowed_vlans": "",
             }
+
             continue
 
         if not current_interface:
@@ -400,6 +420,7 @@ def parse_interface_switchport(output):
             line,
             re.IGNORECASE,
         )
+
         if mode_match:
             results[current_interface]["mode"] = mode_match.group(1).strip()
             continue
@@ -409,6 +430,7 @@ def parse_interface_switchport(output):
             line,
             re.IGNORECASE,
         )
+
         if access_vlan_match:
             results[current_interface]["native_vlan"] = (
                 access_vlan_match.group(1)
@@ -420,6 +442,7 @@ def parse_interface_switchport(output):
             line,
             re.IGNORECASE,
         )
+
         if native_vlan_match:
             results[current_interface]["native_vlan"] = (
                 native_vlan_match.group(1)
@@ -431,6 +454,7 @@ def parse_interface_switchport(output):
             line,
             re.IGNORECASE,
         )
+
         if allowed_vlan_match:
             results[current_interface]["allowed_vlans"] = (
                 allowed_vlan_match.group(1).strip()
@@ -460,7 +484,10 @@ def parse_mac_table(output):
         if not interface_match:
             continue
 
-        interface = normalize_interface_name(interface_match.group("interface"))
+        interface = normalize_interface_name(
+            interface_match.group("interface")
+        )
+
         mac_address = mac_match.group(0).lower()
 
         if interface not in mac_data:
@@ -475,7 +502,7 @@ def parse_mac_table(output):
     return mac_data
 
 def lookup_mac_vendor(mac_address):
-    """Return the manufacturer associated with a MAC OUI when available."""
+    """Return the manufacturer associated with a MAC OUI."""
     if _MAC_LOOKUP is None:
         return "Unknown"
 
@@ -485,12 +512,15 @@ def lookup_mac_vendor(mac_address):
         return "Unknown"
 
 def classify_device(description, vendors):
-    """Best-effort device classification; MAC OUIs cannot identify exact models."""
+    """Best-effort device classification."""
     text = f"{description} {' '.join(vendors)}".upper()
 
     description_types = [
         ("Firewall", r"\b(FW|FIREWALL)\b"),
-        ("Wireless Access Point", r"\b(AP|ACCESS POINT|WAP|WIRELESS)\b"),
+        (
+            "Wireless Access Point",
+            r"\b(AP|ACCESS POINT|WAP|WIRELESS)\b",
+        ),
         ("IP Phone", r"\b(IP PHONE|VOIP|PHONE)\b"),
         ("Printer", r"\b(PRINTER|MFP|COPIER)\b"),
         ("Camera", r"\b(CAMERA|CAM|CCTV)\b"),
@@ -553,24 +583,29 @@ def collect_host(hostname, username, password):
 
     try:
         print(f"\nConnecting to {hostname}...\n")
+
         conn = ConnectHandler(**device)
 
         show_desc = conn.send_command(
             "show interface description",
             read_timeout=60,
         )
+
         show_status = conn.send_command(
             "show interface status",
             read_timeout=60,
         )
+
         show_port_channel = conn.send_command(
             "show port-channel summary",
             read_timeout=60,
         )
+
         show_switchport = conn.send_command(
             "show interface switchport",
             read_timeout=60,
         )
+
         show_mac = conn.send_command(
             "show mac address-table",
             read_timeout=60,
@@ -579,11 +614,17 @@ def collect_host(hostname, username, password):
         mgmt_ip = conn.host
 
     except NetmikoAuthenticationException:
-        print(f"{hostname}: authentication failed.", file=sys.stderr)
+        print(
+            f"{hostname}: authentication failed.",
+            file=sys.stderr,
+        )
         return []
 
     except NetmikoTimeoutException:
-        print(f"{hostname}: connection timed out.", file=sys.stderr)
+        print(
+            f"{hostname}: connection timed out.",
+            file=sys.stderr,
+        )
         return []
 
     except Exception as exc:
@@ -606,7 +647,8 @@ def collect_host(hostname, username, password):
     for iface, interface_data in interfaces.items():
         if iface not in status_data:
             logger.warning(
-                "%s: no parsed status for %s; description operational status=%r",
+                "%s: no parsed status for %s; description operational "
+                "status=%r",
                 hostname,
                 iface,
                 interface_data.get("oper", ""),
@@ -636,11 +678,18 @@ def collect_host(hostname, username, password):
 
         mac_count = mac_info["count"]
         mac_list = mac_info["addresses"]
-        mac_addresses = ", ".join(mac_list) if 0 < mac_count <= 2 else ""
+
+        mac_addresses = (
+            ", ".join(mac_list)
+            if 0 < mac_count <= 2
+            else ""
+        )
 
         mac_vendors = []
+
         for mac_address in mac_list:
             vendor = lookup_mac_vendor(mac_address)
+
             if vendor != "Unknown" and vendor not in mac_vendors:
                 mac_vendors.append(vendor)
 
@@ -651,7 +700,11 @@ def collect_host(hostname, username, password):
         )
 
         device_type = classify_device(desc, mac_vendors)
-        raw_interface_status = status_data.get(iface, {}).get("status", "")
+
+        raw_interface_status = status_data.get(
+            iface,
+            {},
+        ).get("status", "")
 
         if iface.startswith("Po") and iface in port_channel_data:
             raw_interface_status = port_channel_data[iface]["status"]
@@ -688,9 +741,15 @@ def collect_host(hostname, username, password):
             "Admin Status": admin_status,
             "Operational Status": operational_status,
             "Decom/Scream Test Candidate": (
-                "Yes" if decom_scream_candidate else "No"
+                "Yes"
+                if decom_scream_candidate
+                else "No"
             ),
-            "Score Rate": 1 if operational_status == "down" else 0,
+            "Score Rate": (
+                1
+                if operational_status == "down"
+                else 0
+            ),
             "VLAN": status_data.get(iface, {}).get("vlan", ""),
             "Mode": switchport["mode"],
             "Native VLAN": switchport["native_vlan"],
@@ -714,7 +773,9 @@ def collect_host(hostname, username, password):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Collect Cisco NX-OS interface inventory into a CSV file."
+        description=(
+            "Collect Cisco NX-OS interface inventory into a CSV file."
+        )
     )
 
     parser.add_argument(
@@ -742,7 +803,10 @@ def main():
     ]
 
     if not hostnames:
-        print("No hostnames provided.", file=sys.stderr)
+        print(
+            "No hostnames provided.",
+            file=sys.stderr,
+        )
         sys.exit(1)
 
     fields = [
@@ -796,6 +860,7 @@ def main():
 
             try:
                 rows_by_host[index] = future.result()
+
             except Exception as exc:
                 print(
                     f"{hostname}: unexpected collection failure: {exc}",
@@ -816,13 +881,23 @@ def main():
         not in {"admin down", "shutdown"}
     ]
 
-    interface_status_counts = Counter(
-        row["Interface Status"] or "unknown"
+    scheduled_shutdown = [
+        row
         for row in all_rows
-    )
+        if row["Decom/Scream Test Candidate"] == "Yes"
+    ]
 
-    with open(CSV_FILE, "w", newline="", encoding="utf-8") as file:
-        writer = csv.DictWriter(file, fieldnames=fields)
+    with open(
+        CSV_FILE,
+        "w",
+        newline="",
+        encoding="utf-8",
+    ) as file:
+        writer = csv.DictWriter(
+            file,
+            fieldnames=fields,
+        )
+
         writer.writeheader()
         writer.writerows(all_rows)
 
@@ -834,16 +909,57 @@ def main():
         summary_writer.writerows(down_not_shutdown)
 
         summary_writer.writerow([])
-        summary_writer.writerow(["Interface Status Summary"])
-        summary_writer.writerow(["Interface Status", "Count"])
+        summary_writer.writerow(
+            ["Interfaces Scheduled for Shutdown"]
+        )
 
-        for status, count in sorted(interface_status_counts.items()):
-            summary_writer.writerow([status, count])
+        summary_writer.writerow(
+            [
+                "Switch Name",
+                "Management IP",
+                "Interface",
+                "Interface Status",
+                "Admin Status",
+                "Operational Status",
+                "Score Rate",
+                "MAC Count",
+                "MAC Addresses",
+                "Description",
+                "Notes",
+            ]
+        )
+
+        for row in sorted(
+            scheduled_shutdown,
+            key=lambda item: (
+                item["Device"],
+                item["Interface"],
+            ),
+        ):
+            summary_writer.writerow(
+                [
+                    row["Device"],
+                    row["Management IP"],
+                    row["Interface"],
+                    row["Interface Status"],
+                    row["Admin Status"],
+                    row["Operational Status"],
+                    row["Score Rate"],
+                    row["MAC Count"],
+                    row["MAC Addresses"],
+                    row["Description"],
+                    row["Notes"],
+                ]
+            )
 
     print(f"\nCSV written to {CSV_FILE}")
     print(f"Devices processed: {len(hostnames)}")
     print(f"Interfaces processed: {len(all_rows)}")
     print(f"Down ports not shutdown: {len(down_not_shutdown)}")
+    print(
+        "Interfaces scheduled for shutdown: "
+        f"{len(scheduled_shutdown)}"
+    )
 
 if __name__ == "__main__":
     main()
