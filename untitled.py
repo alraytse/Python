@@ -873,18 +873,19 @@ def main():
     for host_rows in rows_by_host:
         all_rows.extend(host_rows or [])
 
+    # Exclude shutdown interfaces from the entire CSV report.
+    all_rows = [
+        row
+        for row in all_rows
+        if row["Operational Status"].strip().lower() != "shutdown"
+    ]
+
     down_not_shutdown = [
         (row["Device"], row["Interface"])
         for row in all_rows
         if row["Operational Status"].lower() == "down"
         and row["Admin Status"].lower()
         not in {"admin down", "shutdown"}
-    ]
-
-    scheduled_shutdown = [
-        row
-        for row in all_rows
-        if row["Decom/Scream Test Candidate"] == "Yes"
     ]
 
     with open(
@@ -908,58 +909,10 @@ def main():
         summary_writer.writerow(["Switch Name", "Port"])
         summary_writer.writerows(down_not_shutdown)
 
-        summary_writer.writerow([])
-        summary_writer.writerow(
-            ["Interfaces Scheduled for Shutdown"]
-        )
-
-        summary_writer.writerow(
-            [
-                "Switch Name",
-                "Management IP",
-                "Interface",
-                "Interface Status",
-                "Admin Status",
-                "Operational Status",
-                "Score Rate",
-                "MAC Count",
-                "MAC Addresses",
-                "Description",
-                "Notes",
-            ]
-        )
-
-        for row in sorted(
-            scheduled_shutdown,
-            key=lambda item: (
-                item["Device"],
-                item["Interface"],
-            ),
-        ):
-            summary_writer.writerow(
-                [
-                    row["Device"],
-                    row["Management IP"],
-                    row["Interface"],
-                    row["Interface Status"],
-                    row["Admin Status"],
-                    row["Operational Status"],
-                    row["Score Rate"],
-                    row["MAC Count"],
-                    row["MAC Addresses"],
-                    row["Description"],
-                    row["Notes"],
-                ]
-            )
-
     print(f"\nCSV written to {CSV_FILE}")
     print(f"Devices processed: {len(hostnames)}")
     print(f"Interfaces processed: {len(all_rows)}")
     print(f"Down ports not shutdown: {len(down_not_shutdown)}")
-    print(
-        "Interfaces scheduled for shutdown: "
-        f"{len(scheduled_shutdown)}"
-    )
 
 if __name__ == "__main__":
     main()
