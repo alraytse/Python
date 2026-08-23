@@ -1,57 +1,113 @@
 #!/usr/bin/env python3
 
-import pandas as pd
+import csv
+import getpass
+import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
+
+import pandas as pd
+from netmiko import ConnectHandler
 
 INPUT_CSV = "bgp_neighbors.csv"
 OUTPUT_MOP = "BGP_Idle_Neighbor_Shutdown_MOP.txt"
 
+def parse_valid_asn(value):
+    """
+    Return a valid ASN string for decimal or Cisco asdot notation.
+
+    Valid range:
+        1–4,294,967,295
+    """
+
+    value = str(value).strip()
+
+    if not value or value.upper() in {
+        "NAN",
+        "UNKNOWN",
+        "NOT_FOUND",
+    }:
+        return None
+
+    match = re.fullmatch(
+        r"(?:router\s+bgp\s+)?(\d+(?:\.\d+)?)",
+        value,
+        re.IGNORECASE,
+    )
+
+    if not match:
+        return None
+
+    asn = match.group(1)
+
+    if re.fullmatch(r"\d+", asn):
+        numeric_asn = int(asn)
+
+        if 1 <= numeric_asn <= 4_294_967_295:
+            return asn
+
+        return None
+
+    asdot_match = re.fullmatch(r"(\d+)\.(\d+)", asn)
+
+    if not asdot_match:
+        return None
+
+    high = int(asdot_match.group(1))
+    low = int(asdot_match.group(2))
+
+    if high > 65_535 or low > 65_535:
+        return None
+
+    numeric_asn = (high * 65_536) + low
+
+    if 1 <= numeric_asn <= 4_294_967_295:
+        return asn
+
+    return None
 
 def get_router_bgp(row):
     """
-    Determine router bgp statement.
+    Determine a safe router BGP statement using a validated ASN.
+
+    Invalid or untrusted values are not written into the MOP.
     """
 
     router_bgp = str(row.get("router_bgp", "")).strip()
     local_asn = str(row.get("local_asn", "")).strip()
 
-    if (
-        router_bgp
-        and router_bgp.upper() != "NOT_FOUND"
-        and router_bgp.upper() != "NAN"
-    ):
-        return router_bgp
+    router_asn = parse_valid_asn(router_bgp)
 
-    if (
-        local_asn
-        and local_asn.upper() != "UNKNOWN"
-        and local_asn.upper() != "NAN"
-    ):
+    if router_asn:
+        return f"router bgp {router_asn}"
+
+    local_asn = parse_valid_asn(local_asn)
+
+    if local_asn:
         return f"router bgp {local_asn}"
 
     return None
 
-
 def main():
-
     print("\nReading BGP CSV...")
 
     try:
         df = pd.read_csv(INPUT_CSV)
-    except Exception as e:
-        print(f"Error reading CSV: {e}")
+
+    except Exception as exc:
+        print(f"Error reading CSV: {exc}")
         return
 
     required_columns = [
         "device",
         "neighbor",
-        "state"
+        "state",
     ]
 
     missing = [
-        col
-        for col in required_columns
-        if col not in df.columns
+        column
+        for column in required_columns
+        if column not in df.columns
     ]
 
     if missing:
@@ -70,158 +126,182 @@ def main():
         print("No Idle neighbors found.")
         return
 
-    with open(OUTPUT_MOP, "w") as f:
+    with open(
+        OUTPUT_MOP,
+        "w",
+        encoding="utf-8",
+    ) as file:
+        file.write("=" * 80 + "\n")
+        file.write("BGP IDLE NEIGHBOR SHUTDOWN MOP\n")
+        file.write("=" * 80 + "\n\n")
 
-        f.write("=" * 80 + "\n")
-        f.write("BGP IDLE NEIGHBOR SHUTDOWN MOP\n")
-        f.write("=" * 80 + "\n\n")
+        file.write(f"Generated: {datetime.now()}\n\n")
 
-        f.write(f"Generated: {datetime.now()}\n\n")
-
-        f.write("PURPOSE\n")
-        f.write("-" * 80 + "\n")
-        f.write(
+        file.write("PURPOSE\n")
+        file.write("-" * 80 + "\n")
+        file.write(
             "Administratively shut down BGP neighbors currently "
             "reporting an Idle state.\n\n"
         )
 
-        f.write("CHANGE RISK\n")
-        f.write("-" * 80 + "\n")
-        f.write(
+        file.write("CHANGE RISK\n")
+        file.write("-" * 80 + "\n")
+        file.write(
             "Low to Moderate. Validate all neighbors before shutdown.\n\n"
         )
 
-        f.write("PRE-CHANGE VALIDATION\n")
-        f.write("-" * 80 + "\n")
-        f.write("show clock\n")
-        f.write("show bgp summary\n")
-        f.write("show ip bgp summary\n")
-        f.write("show bgp vrf all summary\n")
-        f.write("show run | sec router bgp\n")
-        f.write("show logging last 100\n\n")
+        file.write("PRE-CHANGE VALIDATION\n")
+        file.write("-" * 80 + "\n")
+        file.write("show clock\n")
+        file.write("show bgp summary\n")
+        file.write("show ip bgp summary\n")
+        file.write("show bgp vrf all summary\n")
+        file.write("show run | sec router bgp\n")
+        file.write("show logging last 100\n\n")
 
-        f.write("IDLE NEIGHBORS IDENTIFIED\n")
-        f.write("-" * 80 + "\n")
+        file.write("IDLE NEIGHBORS IDENTIFIED\n")
+        file.write("-" * 80 + "\n")
 
         for _, row in idle_df.iterrows():
-
             device = row["device"]
             neighbor = row["neighbor"]
             remote_as = row.get("remote_as", "")
 
-            f.write(
+            file.write(
                 f"{device:<25} "
                 f"{neighbor:<20} "
                 f"Remote-AS {remote_as}\n"
             )
 
-        f.write("\n")
-        f.write("=" * 80 + "\n")
-        f.write("IMPLEMENTATION STEPS\n")
-        f.write("=" * 80 + "\n\n")
+        file.write("\n")
+        file.write("=" * 80 + "\n")
+        file.write("IMPLEMENTATION STEPS\n")
+        file.write("=" * 80 + "\n\n")
 
         for device in sorted(idle_df["device"].unique()):
-
-            f.write(f"\nDEVICE: {device}\n")
-            f.write("-" * 80 + "\n\n")
+            file.write(f"\nDEVICE: {device}\n")
+            file.write("-" * 80 + "\n\n")
 
             device_df = idle_df[
                 idle_df["device"] == device
             ]
 
             first_row = device_df.iloc[0]
-
             bgp_stmt = get_router_bgp(first_row)
 
-            f.write("configure terminal\n")
+            file.write("configure terminal\n")
 
             if not bgp_stmt:
-
-                f.write(
-                    "! WARNING - ASN NOT DISCOVERED\n"
-                    "! MANUAL VERIFICATION REQUIRED\n\n"
+                file.write(
+                    "! WARNING - VALID ASN NOT DISCOVERED\n"
+                    "! ASN MUST BE VERIFIED MANUALLY\n"
+                    "! NO NEIGHBOR SHUTDOWN COMMANDS GENERATED\n\n"
                 )
-
                 continue
 
-            f.write(f"{bgp_stmt}\n")
+            file.write(f"{bgp_stmt}\n")
 
             for _, row in device_df.iterrows():
+                neighbor = str(row["neighbor"]).strip()
 
-                f.write(
-                    f" neighbor {row['neighbor']} shutdown\n"
+                if not neighbor:
+                    file.write(
+                        "! WARNING - EMPTY NEIGHBOR VALUE SKIPPED\n"
+                    )
+                    continue
+
+                if not re.fullmatch(
+                    r"\d+\.\d+\.\d+\.\d+",
+                    neighbor,
+                ):
+                    file.write(
+                        f"! WARNING - INVALID NEIGHBOR VALUE SKIPPED: "
+                        f"{neighbor}\n"
+                    )
+                    continue
+
+                file.write(
+                    f" neighbor {neighbor} shutdown\n"
                 )
 
-            f.write(
+            file.write(
                 " exit\n"
                 "end\n"
                 "copy running-config startup-config\n\n"
             )
 
-        f.write("=" * 80 + "\n")
-        f.write("POST-CHANGE VALIDATION\n")
-        f.write("=" * 80 + "\n\n")
+        file.write("=" * 80 + "\n")
+        file.write("POST-CHANGE VALIDATION\n")
+        file.write("=" * 80 + "\n\n")
 
-        f.write("show bgp summary\n")
-        f.write("show ip bgp summary\n")
-        f.write("show bgp vrf all summary\n")
-        f.write("show run | sec router bgp\n")
-        f.write("show logging last 100\n\n")
+        file.write("show bgp summary\n")
+        file.write("show ip bgp summary\n")
+        file.write("show bgp vrf all summary\n")
+        file.write("show run | sec router bgp\n")
+        file.write("show logging last 100\n\n")
 
-        f.write("=" * 80 + "\n")
-        f.write("ROLLBACK PROCEDURE\n")
-        f.write("=" * 80 + "\n\n")
+        file.write("=" * 80 + "\n")
+        file.write("ROLLBACK PROCEDURE\n")
+        file.write("=" * 80 + "\n\n")
 
         for device in sorted(idle_df["device"].unique()):
-
-            f.write(f"\nDEVICE: {device}\n")
-            f.write("-" * 80 + "\n\n")
+            file.write(f"\nDEVICE: {device}\n")
+            file.write("-" * 80 + "\n\n")
 
             device_df = idle_df[
                 idle_df["device"] == device
             ]
 
             first_row = device_df.iloc[0]
-
             bgp_stmt = get_router_bgp(first_row)
 
-            f.write("configure terminal\n")
+            file.write("configure terminal\n")
 
             if not bgp_stmt:
-
-                f.write(
-                    "! WARNING - ASN NOT DISCOVERED\n"
+                file.write(
+                    "! WARNING - VALID ASN NOT DISCOVERED\n"
                     "! MANUAL ROLLBACK REQUIRED\n\n"
                 )
-
                 continue
 
-            f.write(f"{bgp_stmt}\n")
+            file.write(f"{bgp_stmt}\n")
 
             for _, row in device_df.iterrows():
+                neighbor = str(row["neighbor"]).strip()
 
-                f.write(
-                    f" no neighbor {row['neighbor']} shutdown\n"
+                if not re.fullmatch(
+                    r"\d+\.\d+\.\d+\.\d+",
+                    neighbor,
+                ):
+                    file.write(
+                        f"! WARNING - INVALID NEIGHBOR VALUE SKIPPED: "
+                        f"{neighbor}\n"
+                    )
+                    continue
+
+                file.write(
+                    f" no neighbor {neighbor} shutdown\n"
                 )
 
-            f.write(
+            file.write(
                 " exit\n"
                 "end\n"
                 "copy running-config startup-config\n\n"
             )
 
-        f.write("=" * 80 + "\n")
-        f.write("POST-ROLLBACK VALIDATION\n")
-        f.write("=" * 80 + "\n\n")
+        file.write("=" * 80 + "\n")
+        file.write("POST-ROLLBACK VALIDATION\n")
+        file.write("=" * 80 + "\n\n")
 
-        f.write("show bgp summary\n")
-        f.write("show ip bgp summary\n")
-        f.write("show bgp vrf all summary\n")
+        file.write("show bgp summary\n")
+        file.write("show ip bgp summary\n")
+        file.write("show bgp vrf all summary\n")
+        file.write("show run | sec router bgp\n")
+        file.write("show logging last 100\n")
 
     print("\nMOP created successfully")
     print(f"Output file: {OUTPUT_MOP}")
     print(f"Idle neighbors found: {len(idle_df)}")
-
 
 if __name__ == "__main__":
     main()
