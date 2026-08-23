@@ -571,9 +571,8 @@ def build_notes(row):
     return "; ".join(notes)
 
 def shutdown_reason(row):
-    """Explain why an interface was selected as a shutdown candidate."""
+    """Explain why an interface was selected for the shutdown report."""
     operational_status = row["Operational Status"].strip().lower()
-    mac_count = row["MAC Count"]
 
     if operational_status == "shutdown":
         return "Interface is already shutdown"
@@ -581,11 +580,8 @@ def shutdown_reason(row):
     if operational_status == "down":
         return "Interface is operationally down"
 
-    if operational_status == "up" and mac_count in {1, 2}:
-        return (
-            f"Interface is up with {mac_count} learned "
-            "MAC address(es)"
-        )
+    if operational_status == "up":
+        return "Interface is operationally up but marked as a candidate"
 
     return "Decom/Scream Test candidate"
 
@@ -892,11 +888,16 @@ def main():
     for host_rows in rows_by_host:
         all_rows.extend(host_rows or [])
 
-    # Preserve candidates for the separate shutdown report.
+    # Preserve decom/scream-test candidates for the separate report,
+    # except interfaces that are both operationally and administratively up.
     shutdown_report_rows = [
         row
         for row in all_rows
         if row["Decom/Scream Test Candidate"] == "Yes"
+        and not (
+            row["Operational Status"].strip().lower() == "up"
+            and row["Admin Status"].strip().lower() == "up"
+        )
     ]
 
     # Exclude shutdown interfaces from the main inventory report.
