@@ -3,12 +3,41 @@
 import csv
 import getpass
 import re
+
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from netmiko import ConnectHandler
 
 OUTPUT_CSV = "bgp_neighbors.csv"
 
+def is_valid_asn(asn):
+    """
+    Validate decimal and Cisco asdot ASN formats.
+
+    Valid range:
+        1–4,294,967,295
+    """
+
+    asn = str(asn).strip()
+
+    if re.fullmatch(r"\d+", asn):
+        value = int(asn)
+        return 1 <= value <= 4_294_967_295
+
+    match = re.fullmatch(r"(\d+)\.(\d+)", asn)
+
+    if match:
+        high = int(match.group(1))
+        low = int(match.group(2))
+
+        if high > 65_535 or low > 65_535:
+            return False
+
+        value = (high * 65_536) + low
+
+        return 1 <= value <= 4_294_967_295
+
+    return False
 
 def detect_platform(connection):
     """
@@ -18,7 +47,7 @@ def detect_platform(connection):
     try:
         output = connection.send_command(
             "show version",
-            read_timeout=30
+            read_timeout=30,
         )
 
         if "NX-OS" in output:
@@ -32,52 +61,64 @@ def detect_platform(connection):
     except Exception:
         return "cisco_ios"
 
-
 def get_hostname(connection):
-
     try:
         return connection.find_prompt().rstrip("#>")
     except Exception:
         return "UNKNOWN"
 
-
 def get_bgp_config(connection):
     """
-    Obtain router bgp line and ASN.
+    Obtain the router BGP line and validate the local ASN.
+
+    Supports:
+        Decimal ASNs: 1–4,294,967,295
+        Cisco asdot notation: high.low
     """
 
     commands = [
         "show running-config | sec router bgp",
-        "show run | sec router bgp"
+        "show run | sec router bgp",
     ]
 
+    invalid_asn = None
+    invalid_router_bgp = None
+
     for cmd in commands:
-
         try:
-
             output = connection.send_command(
                 cmd,
-                read_timeout=30
+                read_timeout=30,
             )
 
             match = re.search(
-                r"^(router bgp\s+(\d+))",
+                r"^(router bgp\s+(\d+(?:\.\d+)?))",
                 output,
-                re.MULTILINE | re.IGNORECASE
+                re.MULTILINE | re.IGNORECASE,
             )
 
-            if match:
+            if not match:
+                continue
 
-                router_bgp = match.group(1).strip()
-                local_asn = match.group(2).strip()
+            router_bgp = match.group(1).strip()
+            local_asn = match.group(2).strip()
 
+            if is_valid_asn(local_asn):
                 return local_asn, router_bgp
+
+            invalid_asn = local_asn
+            invalid_router_bgp = router_bgp
 
         except Exception:
             pass
 
-    return "UNKNOWN", "NOT_FOUND"
+    if invalid_asn is not None:
+        print(
+            f"[WARNING] Invalid local ASN found on "
+            f"{invalid_router_bgp}: {invalid_asn}"
+        )
 
+    return "UNKNOWN", "NOT_FOUND"
 
 def get_bgp_summary(connection):
     """
@@ -88,16 +129,14 @@ def get_bgp_summary(connection):
         "show bgp summary",
         "show ip bgp summary",
         "show bgp ipv4 unicast summary",
-        "show bgp vrf all summary"
+        "show bgp vrf all summary",
     ]
 
     for cmd in commands:
-
         try:
-
             output = connection.send_command(
                 cmd,
-                read_timeout=60
+                read_timeout=60,
             )
 
             if (
@@ -113,13 +152,15 @@ def get_bgp_summary(connection):
 
     return None
 
-
-def parse_bgp_summary(hostname, local_asn, router_bgp, output):
-
+def parse_bgp_summary(
+    hostname,
+    local_asn,
+    router_bgp,
+    output,
+):
     records = []
 
     for line in output.splitlines():
-
         line = line.strip()
 
         if not re.match(r"^\d+\.\d+\.\d+\.\d+", line):
@@ -131,7 +172,6 @@ def parse_bgp_summary(hostname, local_asn, router_bgp, output):
             continue
 
         try:
-
             neighbor = fields[0]
             remote_as = fields[2]
             last_field = fields[-1]
@@ -144,25 +184,25 @@ def parse_bgp_summary(hostname, local_asn, router_bgp, output):
             else:
                 state = last_field
 
-            records.append({
-                "device": hostname,
-                "router_bgp": router_bgp,
-                "local_asn": local_asn,
-                "neighbor": neighbor,
-                "remote_as": remote_as,
-                "state": state,
-                "prefixes_received": prefixes_received,
-                "raw_line": line
-            })
+            records.append(
+                {
+                    "device": hostname,
+                    "router_bgp": router_bgp,
+                    "local_asn": local_asn,
+                    "neighbor": neighbor,
+                    "remote_as": remote_as,
+                    "state": state,
+                    "prefixes_received": prefixes_received,
+                    "raw_line": line,
+                }
+            )
 
         except Exception:
             continue
 
     return records
 
-
 def process_device(device_ip, username, password):
-
     results = []
 
     device = {
@@ -173,13 +213,15 @@ def process_device(device_ip, username, password):
         "fast_cli": False,
     }
 
-    try:
+    conn = None
 
+    try:
         conn = ConnectHandler(**device)
 
         platform = detect_platform(conn)
 
         conn.disconnect()
+        conn = None
 
         device["device_type"] = platform
 
@@ -190,67 +232,69 @@ def process_device(device_ip, username, password):
         print(f"[INFO] Connected to {hostname} ({device_ip})")
 
         local_asn, router_bgp = get_bgp_config(conn)
-
         bgp_output = get_bgp_summary(conn)
 
         if bgp_output:
-
             records = parse_bgp_summary(
                 hostname,
                 local_asn,
                 router_bgp,
-                bgp_output
+                bgp_output,
             )
 
             if records:
                 results.extend(records)
             else:
-                results.append({
+                results.append(
+                    {
+                        "device": hostname,
+                        "router_bgp": router_bgp,
+                        "local_asn": local_asn,
+                        "neighbor": "",
+                        "remote_as": "",
+                        "state": "NO_NEIGHBORS_FOUND",
+                        "prefixes_received": "",
+                        "raw_line": "",
+                    }
+                )
+
+        else:
+            results.append(
+                {
                     "device": hostname,
                     "router_bgp": router_bgp,
                     "local_asn": local_asn,
                     "neighbor": "",
                     "remote_as": "",
-                    "state": "NO_NEIGHBORS_FOUND",
+                    "state": "BGP_NOT_CONFIGURED",
                     "prefixes_received": "",
-                    "raw_line": ""
-                })
+                    "raw_line": "",
+                }
+            )
 
-        else:
+    except Exception as exc:
+        print(f"[ERROR] {device_ip}: {exc}")
 
-            results.append({
-                "device": hostname,
-                "router_bgp": router_bgp,
-                "local_asn": local_asn,
+        results.append(
+            {
+                "device": device_ip,
+                "router_bgp": "",
+                "local_asn": "",
                 "neighbor": "",
                 "remote_as": "",
-                "state": "BGP_NOT_CONFIGURED",
+                "state": f"ERROR: {exc}",
                 "prefixes_received": "",
-                "raw_line": ""
-            })
+                "raw_line": "",
+            }
+        )
 
-        conn.disconnect()
-
-    except Exception as e:
-
-        print(f"[ERROR] {device_ip}: {e}")
-
-        results.append({
-            "device": device_ip,
-            "router_bgp": "",
-            "local_asn": "",
-            "neighbor": "",
-            "remote_as": "",
-            "state": f"ERROR: {e}",
-            "prefixes_received": "",
-            "raw_line": ""
-        })
+    finally:
+        if conn:
+            conn.disconnect()
 
     return results
 
-
 def write_csv(results):
-
     fieldnames = [
         "device",
         "router_bgp",
@@ -259,26 +303,24 @@ def write_csv(results):
         "remote_as",
         "state",
         "prefixes_received",
-        "raw_line"
+        "raw_line",
     ]
 
     with open(
         OUTPUT_CSV,
         "w",
-        newline=""
-    ) as f:
-
+        newline="",
+        encoding="utf-8",
+    ) as file:
         writer = csv.DictWriter(
-            f,
-            fieldnames=fieldnames
+            file,
+            fieldnames=fieldnames,
         )
 
         writer.writeheader()
         writer.writerows(results)
 
-
 def main():
-
     print("\n================================")
     print("BGP Neighbor Audit Tool")
     print("================================\n")
@@ -291,9 +333,9 @@ def main():
     )
 
     device_list = [
-        x.strip()
-        for x in switches.split(",")
-        if x.strip()
+        item.strip()
+        for item in switches.split(",")
+        if item.strip()
     ]
 
     if not device_list:
@@ -303,38 +345,35 @@ def main():
     all_results = []
 
     with ThreadPoolExecutor(max_workers=10) as executor:
-
         futures = {
             executor.submit(
                 process_device,
                 device,
                 username,
-                password
+                password,
             ): device
             for device in device_list
         }
 
         for future in as_completed(futures):
-
             try:
-                all_results.extend(
-                    future.result()
-                )
-            except Exception as e:
-                print(e)
+                all_results.extend(future.result())
+
+            except Exception as exc:
+                print(f"[ERROR] {exc}")
 
     write_csv(all_results)
 
     idle_count = sum(
         1
-        for r in all_results
-        if str(r["state"]).lower() == "idle"
+        for result in all_results
+        if str(result["state"]).lower() == "idle"
     )
 
     established_count = sum(
         1
-        for r in all_results
-        if str(r["state"]).lower() == "established"
+        for result in all_results
+        if str(result["state"]).lower() == "established"
     )
 
     print("\n================================")
@@ -344,7 +383,6 @@ def main():
     print(f"Total Records      : {len(all_results)}")
     print(f"Established Peers  : {established_count}")
     print(f"Idle Peers         : {idle_count}")
-
 
 if __name__ == "__main__":
     main()
