@@ -11,8 +11,21 @@ from datetime import datetime
 from netmiko import ConnectHandler
 
 
-SUMMARY_COMMAND = "show ip bgp summary vrf all"
+SUMMARY_COMMANDS = [
+    "show ip bgp summary vrf all",
+    "show ip bgp summary",
+]
 CONFIG_COMMAND = "show running-config | section bgp"
+
+UNSUPPORTED_COMMAND_MARKERS = (
+    "% Invalid",
+    "% Incomplete",
+    "Invalid command",
+    "Invalid input",
+    "Ambiguous command",
+    "Unknown command",
+    "not supported",
+)
 OUTPUT_CSV = "bgp_idle_neighbors.csv"
 OUTPUT_MOP = "BGP_Idle_Neighbor_Shutdown_MOP.txt"
 DEFAULT_DEVICE_TYPE = "cisco_ios"
@@ -118,6 +131,35 @@ def extract_vrf(line, current_vrf):
             return match.group(1).strip()
 
     return current_vrf
+
+
+def get_bgp_summary(connection, hostname):
+    """Try the all-VRF command, then fall back to the default BGP summary."""
+
+    for command in SUMMARY_COMMANDS:
+        try:
+            output = connection.send_command(
+                command,
+                read_timeout=60,
+            )
+        except Exception:
+            continue
+
+        if not output or any(
+            marker.lower() in output.lower()
+            for marker in UNSUPPORTED_COMMAND_MARKERS
+        ):
+            continue
+
+        if command != SUMMARY_COMMANDS[0]:
+            print(
+                f"[INFO] {hostname}: VRF summary unsupported; "
+                f"using {command}"
+            )
+
+        return command, output
+
+    return None, None
 
 
 def parse_bgp_summary(hostname, device_ip, output):
@@ -261,10 +303,15 @@ def collect_device(device_ip, username, password):
 
         print(f"[INFO] Connected to {hostname} ({device_ip})")
 
-        summary_output = connection.send_command(
-            SUMMARY_COMMAND,
-            read_timeout=60,
+        summary_command, summary_output = get_bgp_summary(
+            connection,
+            hostname,
         )
+
+        if not summary_output:
+            raise BgpCollectionError(
+                f"{hostname}: no supported BGP summary command succeeded"
+            )
 
         config_output = connection.send_command(
             CONFIG_COMMAND,
