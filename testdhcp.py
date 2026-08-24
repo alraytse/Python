@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 
 import argparse
@@ -51,10 +50,13 @@ def extract_cidr(text):
     if not match:
         return ""
 
-    cidr = match.group(0)
-
     try:
-        return str(ipaddress.ip_network(cidr, strict=False))
+        return str(
+            ipaddress.ip_network(
+                match.group(0),
+                strict=False,
+            )
+        )
     except ValueError:
         return ""
 
@@ -113,12 +115,6 @@ def extract_network_label(text):
     for pattern in patterns:
         for match in re.finditer(pattern, text, re.IGNORECASE):
             label = normalize_space(match.group(1))
-            label = re.sub(
-                r"\s+Network\s+View\s*[:=].*$",
-                "",
-                label,
-                flags=re.IGNORECASE,
-            )
 
             if label and label not in labels:
                 labels.append(label)
@@ -158,7 +154,11 @@ def extract_network_view(text):
 def extract_site_code(text, custom_pattern=""):
     if custom_pattern:
         try:
-            match = re.search(custom_pattern, text, re.IGNORECASE)
+            match = re.search(
+                custom_pattern,
+                text,
+                re.IGNORECASE,
+            )
 
             if match:
                 return (
@@ -178,7 +178,11 @@ def extract_site_code(text, custom_pattern=""):
     ]
 
     for pattern in labeled_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE,
+        )
 
         if match:
             return match.group(1).strip()
@@ -216,12 +220,18 @@ def text_matches(text, match_text, require_uson=False):
 
 def extract_gateway(text):
     patterns = [
-        rf"(?:default\s+gateway|gateway|routers?|router)\s*[:=]?\s*({IP_RE})",
-        rf"({IP_RE})\s*(?:\([^)]*\))?\s*(?:default\s+gateway|gateway|router)\b",
+        rf"(?:default\s+gateway|gateway|routers?|router)"
+        rf"\s*[:=]?\s*({IP_RE})",
+        rf"({IP_RE})\s*(?:\([^)]*\))?\s*"
+        rf"(?:default\s+gateway|gateway|router)\b",
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
+        match = re.search(
+            pattern,
+            text,
+            re.IGNORECASE,
+        )
 
         if match and valid_ipv4(match.group(1)):
             return match.group(1)
@@ -327,6 +337,7 @@ def write_raw_output(raw_dir, hostname, command_name, output):
     )
 
     path = raw_dir / f"{safe_host}_{safe_command}.txt"
+
     path.write_text(
         output or "",
         encoding="utf-8",
