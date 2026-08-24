@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 import csv
-import re
 import getpass
+import re
 from datetime import datetime
 
 from netmiko import ConnectHandler
@@ -16,10 +16,10 @@ OUTPUT_FILE = (
     f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv"
 )
 
-
 def load_csv(filename):
     """
-    CSV Format:
+    CSV format:
+
     Switch Name,Port
     DDC1-ISP-DSW1,Eth1/4
     DDC1-ISP-DSW1,Eth1/8
@@ -27,20 +27,36 @@ def load_csv(filename):
 
     inventory = {}
 
-    with open(filename, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
+    with open(filename, "r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file)
 
-        for row in reader:
-            switch = row["Switch Name"].strip()
-            interface = row["Port"].strip()
+        if not reader.fieldnames:
+            raise ValueError("CSV file is empty or missing headers.")
+
+        required_headers = {"Switch Name", "Port"}
+        missing_headers = required_headers - set(reader.fieldnames)
+
+        if missing_headers:
+            raise ValueError(
+                "CSV is missing required header(s): "
+                + ", ".join(sorted(missing_headers))
+            )
+
+        for line_number, row in enumerate(reader, start=2):
+            switch = (row.get("Switch Name") or "").strip()
+            interface = (row.get("Port") or "").strip()
+
+            if not switch or not interface:
+                print(
+                    f"Skipping incomplete CSV row {line_number}."
+                )
+                continue
 
             inventory.setdefault(switch, []).append(interface)
 
     return inventory
 
-
 def connect_device(host, username, password):
-
     device = {
         "device_type": "cisco_nxos",
         "host": host,
@@ -51,22 +67,18 @@ def connect_device(host, username, password):
 
     return ConnectHandler(**device)
 
-
 def count_macs(output):
-
-    regex = r"([0-9a-f]{4}\.){2}[0-9a-f]{4}"
+    mac_regex = r"(?:[0-9a-f]{4}\.){2}[0-9a-f]{4}"
 
     count = 0
 
     for line in output.splitlines():
-        if re.search(regex, line, re.I):
+        if re.search(mac_regex, line, re.IGNORECASE):
             count += 1
 
     return count
 
-
 def evaluate_interface(conn, interface):
-
     result = {
         "status": "",
         "description": "",
@@ -80,246 +92,235 @@ def evaluate_interface(conn, interface):
     }
 
     try:
-
         status_output = conn.send_command(
-            f"show interface status | include {interface}"
+            f"show interface status | include {interface}",
+            read_timeout=60,
         )
 
-        result["status"] = status_output
+        result["status"] = status_output.strip()
 
-        desc_output = conn.send_command(
-            f"show interface description | include {interface}"
+        description_output = conn.send_command(
+            f"show interface description | include {interface}",
+            read_timeout=60,
         )
 
-        result["description"] = desc_output
+        result["description"] = description_output.strip()
 
         run_output = conn.send_command(
-            f"show running-config interface {interface}"
+            f"show running-config interface {interface}",
+            read_timeout=60,
         )
 
-        #
-        # Interface already administratively down
-        #
-        if re.search(r"^\s*shutdown$", run_output, re.M):
-
+        if re.search(r"^\s*shutdown\s*$", run_output, re.MULTILINE):
             result["admin_state"] = "SHUTDOWN"
             result["recommendation"] = "ALREADY_SHUTDOWN"
-
             return result
 
         result["admin_state"] = "NO SHUTDOWN"
 
-        #
-        # Access / Trunk
-        #
-        if "switchport mode trunk" in run_output:
+        run_output_lower = run_output.lower()
+
+        if "switchport mode trunk" in run_output_lower:
             result["mode"] = "TRUNK"
 
-        elif "switchport mode access" in run_output:
+        elif "switchport mode access" in run_output_lower:
             result["mode"] = "ACCESS"
 
         else:
             result["mode"] = "UNKNOWN"
 
-        #
-        # Port-channel membership
-        #
-        po_output = conn.send_command(
-            f"show port-channel summary | include {interface}"
+        port_channel_output = conn.send_command(
+            f"show port-channel summary | include {interface}",
+            read_timeout=60,
         )
 
-        if po_output.strip():
+        if port_channel_output.strip():
             result["port_channel"] = "YES"
 
-        #
-        # MACs
-        #
         mac_output = conn.send_command(
-            f"show mac address-table interface {interface}"
+            f"show mac address-table interface {interface}",
+            read_timeout=60,
         )
 
         result["mac_count"] = count_macs(mac_output)
 
-        #
-        # CDP
-        #
         cdp_output = conn.send_command(
-            f"show cdp neighbors interface {interface}"
+            f"show cdp neighbors interface {interface}",
+            read_timeout=60,
         )
 
-        if (
-            "Device ID" in cdp_output
-            or "device id" in cdp_output.lower()
-        ):
+        if "device id" in cdp_output.lower():
             result["cdp"] = "YES"
 
-        #
-        # LLDP
-        #
         lldp_output = conn.send_command(
-            f"show lldp neighbors interface {interface}"
+            f"show lldp neighbors interface {interface}",
+            read_timeout=60,
         )
 
-        if (
-            "Device ID" in lldp_output
-            or "Local Intf" in lldp_output
-            or "Port ID" in lldp_output
-        ):
+        lldp_markers = (
+            "device id",
+            "local intf",
+            "port id",
+        )
+
+        if any(marker in lldp_output.lower() for marker in lldp_markers):
             result["lldp"] = "YES"
 
-        #
-        # Recommendation logic
-        #
-        safe = True
+        safe_to_shutdown = True
 
         if "connected" in status_output.lower():
-            safe = False
+            safe_to_shutdown = False
 
         if result["port_channel"] == "YES":
-            safe = False
+            safe_to_shutdown = False
 
         if result["mode"] == "TRUNK":
-            safe = False
+            safe_to_shutdown = False
 
         if result["mac_count"] > 0:
-            safe = False
+            safe_to_shutdown = False
 
         if result["cdp"] == "YES":
-            safe = False
+            safe_to_shutdown = False
 
         if result["lldp"] == "YES":
-            safe = False
+            safe_to_shutdown = False
 
-        if safe:
+        if safe_to_shutdown:
             result["recommendation"] = "SAFE_TO_SHUTDOWN"
         else:
             result["recommendation"] = "REVIEW_REQUIRED"
 
-    except Exception as e:
-
-        result["recommendation"] = f"ERROR: {str(e)}"
+    except Exception as exc:
+        result["recommendation"] = f"ERROR: {exc}"
 
     return result
 
-
 def main():
-
     print("\n=== Down Interface Precheck Utility ===\n")
 
-    csv_file = input(
-        "CSV File: "
-    ).strip()
-
-    username = input(
-        "Username: "
-    ).strip()
-
-    password = getpass.getpass(
-        "Password: "
-    )
+    csv_file = input("CSV File: ").strip()
+    username = input("Username: ").strip()
+    password = getpass.getpass("Password: ")
 
     switch_filter = input(
         "\nComma Delimited Switch List "
         "(blank = all switches): "
     ).strip()
 
-    inventory = load_csv(csv_file)
+    try:
+        inventory = load_csv(csv_file)
+
+    except FileNotFoundError:
+        print(f"CSV file not found: {csv_file}")
+        return
+
+    except ValueError as exc:
+        print(f"CSV error: {exc}")
+        return
+
+    if not inventory:
+        print("No valid switch/interface entries were found.")
+        return
 
     if switch_filter:
-
         allowed_switches = {
-            x.strip().upper()
-            for x in switch_filter.split(",")
-            if x.strip()
+            switch.strip().upper()
+            for switch in switch_filter.split(",")
+            if switch.strip()
         }
 
         inventory = {
-            sw: interfaces
-            for sw, interfaces in inventory.items()
-            if sw.upper() in allowed_switches
+            switch: interfaces
+            for switch, interfaces in inventory.items()
+            if switch.upper() in allowed_switches
         }
 
-    with open(
-        OUTPUT_FILE,
-        "w",
-        newline=""
-    ) as outfile:
+    if not inventory:
+        print("No switches matched the supplied filter.")
+        return
 
-        writer = csv.writer(outfile)
+    try:
+        with open(
+            OUTPUT_FILE,
+            "w",
+            newline="",
+            encoding="utf-8",
+        ) as outfile:
 
-        writer.writerow([
-            "Switch",
-            "Interface",
-            "Admin_State",
-            "Status",
-            "Description",
-            "Mode",
-            "PortChannel",
-            "MAC_Count",
-            "CDP",
-            "LLDP",
-            "Recommendation",
-        ])
+            writer = csv.writer(outfile)
 
-        for switch in inventory:
+            writer.writerow(
+                [
+                    "Switch",
+                    "Interface",
+                    "Admin_State",
+                    "Status",
+                    "Description",
+                    "Mode",
+                    "PortChannel",
+                    "MAC_Count",
+                    "CDP",
+                    "LLDP",
+                    "Recommendation",
+                ]
+            )
 
-            print(f"\nConnecting to {switch}")
+            for switch, interfaces in inventory.items():
+                print(f"\nConnecting to {switch}")
 
-            try:
+                conn = None
 
-                conn = connect_device(
-                    switch,
-                    username,
-                    password,
-                )
-
-                for interface in inventoryprint(
-                        f"  Checking {interface}"
-                    )
-
-                    result = evaluate_interface(
-                        conn,
-                        interface,
-                    )
-
-                    writer.writerow([
+                try:
+                    conn = connect_device(
                         switch,
-                        interface,
-                        result["admin_state"],
-                        result["status"],
-                        result["description"],
-                        result["mode"],
-                        result["port_channel"],
-                        result["mac_count"],
-                        result["cdp"],
-                        result["lldp"],
-                        result["recommendation"],
-                    ])
+                        username,
+                        password,
+                    )
 
-                conn.disconnect()
+                    for interface in interfaces:
+                        print(f"  Checking {interface}")
 
-            except NetmikoAuthenticationException:
+                        result = evaluate_interface(
+                            conn,
+                            interface,
+                        )
 
-                print(
-                    f"Authentication Failure: {switch}"
-                )
+                        writer.writerow(
+                            [
+                                switch,
+                                interface,
+                                result["admin_state"],
+                                result["status"],
+                                result["description"],
+                                result["mode"],
+                                result["port_channel"],
+                                result["mac_count"],
+                                result["cdp"],
+                                result["lldp"],
+                                result["recommendation"],
+                            ]
+                        )
 
-            except NetmikoTimeoutException:
+                except NetmikoAuthenticationException:
+                    print(f"Authentication Failure: {switch}")
 
-                print(
-                    f"Timeout: {switch}"
-                )
+                except NetmikoTimeoutException:
+                    print(f"Timeout: {switch}")
 
-            except Exception as e:
+                except Exception as exc:
+                    print(f"Error connecting to {switch}: {exc}")
 
-                print(
-                    f"Error connecting to "
-                    f"{switch}: {e}"
-                )
+                finally:
+                    if conn is not None:
+                        conn.disconnect()
+
+    except OSError as exc:
+        print(f"Unable to write report: {exc}")
+        return
 
     print("\nCompleted.")
     print(f"Report: {OUTPUT_FILE}")
-
 
 if __name__ == "__main__":
     main()
