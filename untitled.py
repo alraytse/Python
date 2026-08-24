@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 
 import argparse
@@ -33,9 +34,9 @@ CSV_FILE = "inventory_report.csv"
 logger = logging.getLogger(__name__)
 
 INTERFACE_RE = (
-    r"(?:(?:Eth|Gi|Te|Po)\d+(?:/\d+)*|"
-    r"(?:Ethernet|GigabitEthernet|TenGigabitEthernet|Port-channel)"
-    r"\d+(?:/\d+)*)"
+    r"(?:(?:Eth|Gi|Te|Po|Tu)\d+(?:/\d+)*|"
+    r"(?:Ethernet|GigabitEthernet|TenGigabitEthernet|"
+    r"Port-channel|Tunnel)\d+(?:/\d+)*)"
 )
 
 def find_vendor(desc):
@@ -122,6 +123,7 @@ def normalize_interface_name(interface):
         "GigabitEthernet": "Gi",
         "TenGigabitEthernet": "Te",
         "Port-channel": "Po",
+        "Tunnel": "Tu",
     }
 
     for long_name, short_name in replacements.items():
@@ -888,8 +890,6 @@ def main():
     for host_rows in rows_by_host:
         all_rows.extend(host_rows or [])
 
-    # Preserve decom/scream-test candidates for the separate report,
-    # except interfaces that are both operationally and administratively up.
     shutdown_report_rows = [
         row
         for row in all_rows
@@ -900,7 +900,6 @@ def main():
         )
     ]
 
-    # Exclude shutdown interfaces from the main inventory report.
     all_rows = [
         row
         for row in all_rows
