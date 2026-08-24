@@ -2,110 +2,99 @@
 
 import argparse
 import csv
-import getpass
 import ipaddress
 import re
 import sys
-from pathlib import Path
 
-from netmiko import ConnectHandler
-from netmiko.exceptions import (
-    NetmikoAuthenticationException,
-    NetmikoTimeoutException,
-)
-
-DEFAULT_OUTPUT = "azure_local_dhcp_networks.csv"
-DEFAULT_RAW_DIR = "infoblox_raw_output"
-DEFAULT_TIMEOUT = 60
+DEFAULT_OUTPUT = "filtered_infoblox_dhcp_networks.csv"
 
 IP_RE = r"\b(?:\d{1,3}\.){3}\d{1,3}\b"
 CIDR_RE = rf"\b{IP_RE}/\d{{1,2}}\b"
 
-OUTPUT_FIELDS = [
+DERIVED_FIELDS = [
     "Site Code",
     "IP Range",
     "Gateway",
     "DHCP Range",
     "Network Name or Comment",
     "Network View",
-    "Infoblox Device",
-    "Notes",
+    "Filter Notes",
 ]
 
-HOST_COLUMNS = [
-    "Infoblox IP",
-    "Infoblox Host",
-    "Infoblox Device",
-    "Management IP",
-    "IP Address",
-    "IP",
-    "Host",
-    "Hostname",
-    "Device",
-]
+COLUMN_ALIASES = {
+    "network": [
+        "network",
+        "network address",
+        "network cidr",
+        "cidr",
+        "ip range",
+        "subnet",
+        "network range",
+    ],
+    "dhcp": [
+        "dhcp range",
+        "dhcp ranges",
+        "range",
+        "ranges",
+        "dhcp_range",
+        "start end",
+        "start/end",
+    ],
+    "dhcp_start": [
+        "dhcp start",
+        "range start",
+        "start ip",
+        "start address",
+        "start",
+    ],
+    "dhcp_end": [
+        "dhcp end",
+        "range end",
+        "end ip",
+        "end address",
+        "end",
+    ],
+    "name": [
+        "network name",
+        "name",
+        "network name or comment",
+        "comment",
+        "comments",
+        "description",
+        "network description",
+    ],
+    "gateway": [
+        "gateway",
+        "default gateway",
+        "router",
+        "routers",
+        "default routers",
+    ],
+    "view": [
+        "network view",
+        "network_view",
+        "view",
+    ],
+    "site": [
+        "site code",
+        "site",
+        "site name",
+    ],
+}
+
+def normalize_header(value):
+    return re.sub(
+        r"[^a-z0-9]+",
+        " ",
+        value or "",
+    ).strip().lower()
 
 def normalize_space(value):
-    return re.sub(r"\s+", " ", value or "").strip()
-
-def load_infoblox_hosts(filename, requested_column=""):
-    """Load unique Infoblox hosts from a CSV file."""
-    with open(
-        filename,
-        "r",
-        encoding="utf-8-sig",
-        newline="",
-    ) as csvfile:
-        reader = csv.DictReader(csvfile)
-
-        if not reader.fieldnames:
-            raise ValueError("The CSV file does not contain a header row.")
-
-        field_lookup = {
-            normalize_space(field).lower(): field
-            for field in reader.fieldnames
-            if field
-        }
-
-        if requested_column:
-            requested_key = requested_column.strip().lower()
-            host_column = field_lookup.get(requested_key)
-
-            if not host_column:
-                raise ValueError(
-                    f"Column '{requested_column}' was not found. "
-                    f"Available columns: {', '.join(reader.fieldnames)}"
-                )
-        else:
-            host_column = None
-
-            for candidate in HOST_COLUMNS:
-                host_column = field_lookup.get(candidate.lower())
-
-                if host_column:
-                    break
-
-            if not host_column:
-                raise ValueError(
-                    "No supported host column was found. Expected one of: "
-                    + ", ".join(HOST_COLUMNS)
-                )
-
-        hosts = []
-        seen = set()
-
-        for row in reader:
-            host = normalize_space(row.get(host_column, ""))
-
-            if not host:
-                continue
-
-            host_key = host.lower()
-
-            if host_key not in seen:
-                hosts.append(host)
-                seen.add(host_key)
-
-    return hosts, host_column
+    return re.sub(
+        r"\s+",
+        " ",
+        value or "",
+    ).strip()
 
 def parse_ipv4(value):
     return ipaddress.ip_address(value)
@@ -116,8 +105,43 @@ def valid_ipv4(value):
     except ValueError:
         return False
 
+def find_column(fieldnames, aliases):
+    normalized = {
+        normalize_header(field): field
+        for field in fieldnames
+        if field
+    }
+
+    for alias in aliases:
+        field = normalized.get(
+            normalize_header(alias)
+        )
+
+        if field:
+            return field
+
+    return ""
+
+def detect_columns(fieldnames):
+    return {
+        key: find_column(fieldnames, aliases)
+        for key, aliases in COLUMN_ALIASES.items()
+    }
+
+def row_text(row):
+    return " ".join(
+        normalize_space(str(value))
+        for value in row.values()
+        if value is not None
+        and normalize_space(str(value))
+    )
+
 def extract_cidr(text):
-    match = re.search(CIDR_RE, text, re.IGNORECASE)
+    match = re.search(
+        CIDR_RE,
+        text or "",
+        re.IGNORECASE,
+    )
 
     if not match:
         return ""
@@ -132,165 +156,30 @@ def extract_cidr(text):
     except ValueError:
         return ""
 
-def network_blocks(output):
-    """Split network output into blocks keyed by network CIDR."""
-    blocks = []
-    current = None
+def extract_first_ip(text):
+    for value in re.findall(
+        IP_RE,
+        text or "",
+    ):
+        if valid_ipv4(value):
+            return value
 
-    for raw_line in output.splitlines():
-        line = raw_line.rstrip()
-        cidr = extract_cidr(line)
+    return ""
 
-        if cidr:
-            if current is not None:
-                blocks.append(current)
-
-            current = {
-                "cidr": cidr,
-                "text": line,
-            }
-            continue
-
-        if current is not None:
-            current["text"] += "\n" + line
-
-    if current is not None:
-        blocks.append(current)
-
-    return blocks
-
-def unique_networks(blocks):
-    """Deduplicate networks while retaining their combined text."""
-    combined = {}
-
-    for block in blocks:
-        cidr = block["cidr"]
-
-        if cidr not in combined:
-            combined[cidr] = {
-                "cidr": cidr,
-                "text": block["text"],
-            }
-        else:
-            combined[cidr]["text"] += "\n" + block["text"]
-
-    return list(combined.values())
-
-def extract_network_label(text):
-    patterns = [
-        r"(?:network\s+name|name|comment|description)\s*[:=]\s*([^\n]+)",
-        r"(?:network\s+name|comment|description)\s+([^\n]+)",
-    ]
-
-    labels = []
-
-    for pattern in patterns:
-        for match in re.finditer(pattern, text, re.IGNORECASE):
-            label = normalize_space(match.group(1))
-
-            if label and label not in labels:
-                labels.append(label)
-
-    if labels:
-        return "; ".join(labels)
-
-    useful_lines = []
-
-    for line in text.splitlines():
-        line = normalize_space(line)
-
-        if not line:
-            continue
-
-        if re.search(CIDR_RE, line, re.IGNORECASE):
-            continue
-
-        if re.search(
-            r"azure\s+local|uson|idrac|comment|description|network\s+name",
-            line,
-            re.IGNORECASE,
-        ):
-            useful_lines.append(line)
-
-    return "; ".join(useful_lines[:3])
-
-def extract_network_view(text):
-    match = re.search(
-        r"(?:network\s+view|network_view)\s*[:=]\s*([^\s,;]+)",
-        text,
-        re.IGNORECASE,
+def extract_gateway(row, columns, combined_text):
+    gateway_column = columns.get(
+        "gateway",
+        "",
     )
 
-    return match.group(1).strip() if match else ""
-
-def extract_site_code(text, custom_pattern=""):
-    if custom_pattern:
-        try:
-            match = re.search(
-                custom_pattern,
-                text,
-                re.IGNORECASE,
-            )
-
-            if match:
-                return (
-                    match.group(1).strip()
-                    if match.lastindex
-                    else match.group(0).strip()
-                )
-
-        except re.error as exc:
-            raise ValueError(
-                f"Invalid site-code regex: {exc}"
-            ) from exc
-
-    labeled_patterns = [
-        r"site\s*code\s*[:=]\s*([A-Za-z0-9_-]+)",
-        r"site\s*[:=]\s*([A-Za-z0-9_-]+)",
-    ]
-
-    for pattern in labeled_patterns:
-        match = re.search(
-            pattern,
-            text,
-            re.IGNORECASE,
+    if gateway_column:
+        gateway = extract_first_ip(
+            row.get(gateway_column, "")
         )
 
-        if match:
-            return match.group(1).strip()
+        if gateway:
+            return gateway
 
-    code_matches = re.findall(
-        r"\b[A-Z]{2,8}\d{1,3}\b",
-        text.upper(),
-    )
-
-    for code in code_matches:
-        if code != "USON":
-            return code
-
-    match = re.search(
-        r"\bUSON[-_ ]([A-Z0-9][A-Z0-9_-]*)",
-        text,
-        re.IGNORECASE,
-    )
-
-    if match:
-        return match.group(1).strip("-_")
-
-    return "UNKNOWN"
-
-def text_matches(text, match_text, require_uson=False):
-    normalized = normalize_space(text).lower()
-
-    if match_text.lower() not in normalized:
-        return False
-
-    if require_uson and "uson" not in normalized:
-        return False
-
-    return "idrac" not in normalized
-
-def extract_gateway(text):
     patterns = [
         rf"(?:default\s+gateway|gateway|routers?|router)"
         rf"\s*[:=]?\s*({IP_RE})",
@@ -301,7 +190,7 @@ def extract_gateway(text):
     for pattern in patterns:
         match = re.search(
             pattern,
-            text,
+            combined_text,
             re.IGNORECASE,
         )
 
@@ -310,273 +199,356 @@ def extract_gateway(text):
 
     return ""
 
-def extract_ip_pairs(text):
-    """Extract likely DHCP start/end pairs from range output lines."""
-    pairs = []
+def extract_site_code(row, columns, combined_text):
+    site_column = columns.get(
+        "site",
+        "",
+    )
 
-    for line in text.splitlines():
-        line = line.strip()
-
-        if not line:
-            continue
-
-        addresses = [
-            address
-            for address in re.findall(IP_RE, line)
-            if valid_ipv4(address)
-        ]
-
-        if len(addresses) < 2:
-            continue
-
-        has_range_context = bool(
-            re.search(
-                r"range|start|end|to|[-–—]",
-                line,
-                re.IGNORECASE,
-            )
+    if site_column:
+        site_value = normalize_space(
+            row.get(site_column, "")
         )
 
-        if not has_range_context:
+        if site_value:
+            return site_value
+
+    labeled_patterns = [
+        r"site\s*code\s*[:=]\s*([A-Za-z0-9_-]+)",
+        r"site\s*[:=]\s*([A-Za-z0-9_-]+)",
+    ]
+
+    for pattern in labeled_patterns:
+        match = re.search(
+            pattern,
+            combined_text,
+            re.IGNORECASE,
+        )
+
+        if match:
+            return match.group(1).strip()
+
+    code_matches = re.findall(
+        r"\b[A-Z]{2,8}\d{1,3}\b",
+        combined_text.upper(),
+    )
+
+    for code in code_matches:
+        if code != "USON":
+            return code
+
+    match = re.search(
+        r"\bUSON[-_ ]([A-Z0-9][A-Z0-9_-]*)",
+        combined_text,
+        re.IGNORECASE,
+    )
+
+    if match:
+        return match.group(1).strip("-_")
+
+    return "UNKNOWN"
+
+def extract_network_name(row, columns, combined_text):
+    name_column = columns.get(
+        "name",
+        "",
+    )
+
+    if name_column:
+        name = normalize_space(
+            row.get(name_column, "")
+        )
+
+        if name:
+            return name
+
+    patterns = [
+        r"(?:network\s+name|name|comment|description)"
+        r"\s*[:=]\s*([^,;\n]+)",
+    ]
+
+    labels = []
+
+    for pattern in patterns:
+        for match in re.finditer(
+            pattern,
+            combined_text,
+            re.IGNORECASE,
+        ):
+            label = normalize_space(
+                match.group(1)
+            )
+
+            if label and label not in labels:
+                labels.append(label)
+
+    return "; ".join(labels)
+
+def extract_network_view(row, columns, combined_text):
+    view_column = columns.get(
+        "view",
+        "",
+    )
+
+    if view_column:
+        view = normalize_space(
+            row.get(view_column, "")
+        )
+
+        if view:
+            return view
+
+    match = re.search(
+        r"(?:network\s+view|network_view)"
+        r"\s*[:=]\s*([^\s,;]+)",
+        combined_text,
+        re.IGNORECASE,
+    )
+
+    return match.group(1).strip() if match else ""
+
+def extract_range_pairs(text):
+    """Extract IP start/end pairs from a value containing a range."""
+    pairs = []
+
+    range_pattern = re.compile(
+        rf"({IP_RE})\s*(?:-|–|—|to|through)\s*({IP_RE})",
+        re.IGNORECASE,
+    )
+
+    for match in range_pattern.finditer(
+        text or ""
+    ):
+        start = match.group(1)
+        end = match.group(2)
+
+        if not valid_ipv4(start):
             continue
 
-        for index in range(len(addresses) - 1):
-            start = addresses[index]
-            end = addresses[index + 1]
+        if not valid_ipv4(end):
+            continue
 
-            try:
-                if parse_ipv4(start) <= parse_ipv4(end):
-                    pair = (start, end)
+        if parse_ipv4(start) <= parse_ipv4(end):
+            pair = (start, end)
 
-                    if pair not in pairs:
-                        pairs.append(pair)
-
-            except ValueError:
-                continue
+            if pair not in pairs:
+                pairs.append(pair)
 
     return pairs
 
-def find_dhcp_ranges(range_output, network_cidr, network_detail=""):
-    """Return DHCP ranges whose endpoints are inside the target network."""
-    target_network = ipaddress.ip_network(
-        network_cidr,
-        strict=False,
+def format_dhcp_ranges(row, columns, combined_text):
+    values = []
+
+    dhcp_column = columns.get(
+        "dhcp",
+        "",
     )
 
-    pairs = extract_ip_pairs(range_output)
-    pairs.extend(extract_ip_pairs(network_detail))
+    if dhcp_column:
+        values.append(
+            row.get(dhcp_column, "")
+        )
 
-    matching = []
+    start_column = columns.get(
+        "dhcp_start",
+        "",
+    )
+
+    end_column = columns.get(
+        "dhcp_end",
+        "",
+    )
+
+    if start_column and end_column:
+        start = extract_first_ip(
+            row.get(start_column, "")
+        )
+
+        end = extract_first_ip(
+            row.get(end_column, "")
+        )
+
+        if start and end:
+            values.append(
+                f"{start}-{end}"
+            )
+
+    if not values:
+        for field, value in row.items():
+            field_name = normalize_header(field)
+
+            if (
+                "dhcp" in field_name
+                or "range" in field_name
+            ):
+                values.append(value)
+
+    if not values:
+        values.append(combined_text)
+
+    ranges = []
     seen = set()
 
-    for start, end in pairs:
-        start_ip = parse_ipv4(start)
-        end_ip = parse_ipv4(end)
+    for value in values:
+        for start, end in extract_range_pairs(
+            str(value)
+        ):
+            range_value = f"{start}-{end}"
 
-        if start_ip not in target_network:
-            continue
+            if range_value not in seen:
+                ranges.append(range_value)
+                seen.add(range_value)
 
-        if end_ip not in target_network:
-            continue
+    return "; ".join(ranges)
 
-        range_value = f"{start}-{end}"
+def read_csv(filename):
+    with open(
+        filename,
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as csvfile:
+        reader = csv.DictReader(csvfile)
 
-        if range_value not in seen:
-            matching.append(range_value)
-            seen.add(range_value)
+        if not reader.fieldnames:
+            raise ValueError(
+                "The CSV file does not contain a header row."
+            )
 
-    return matching
+        rows = list(reader)
 
-def get_command(connection, command, timeout):
-    return connection.send_command(
-        command,
-        read_timeout=timeout,
-        strip_prompt=True,
-        strip_command=True,
-    )
+    return reader.fieldnames, rows
 
-def write_raw_output(raw_dir, hostname, command_name, output):
-    safe_host = re.sub(
-        r"[^A-Za-z0-9_.-]+",
-        "_",
-        hostname,
-    )
-
-    safe_command = re.sub(
-        r"[^A-Za-z0-9_.-]+",
-        "_",
-        command_name,
-    )
-
-    path = raw_dir / f"{safe_host}_{safe_command}.txt"
-
-    path.write_text(
-        output or "",
-        encoding="utf-8",
-    )
-
-def collect_device(
-    host,
-    username,
-    password,
+def filter_rows(
+    fieldnames,
+    rows,
     match_text,
     require_uson,
-    site_code_pattern,
-    network_command,
-    range_command,
-    timeout,
-    raw_dir,
+    dhcp_contains,
+    exclude_text,
 ):
-    connection = None
-    results = []
+    columns = detect_columns(fieldnames)
+    output_rows = []
 
-    try:
-        connection = ConnectHandler(
-            device_type="infoblox_nios",
-            host=host,
-            username=username,
-            password=password,
-            fast_cli=False,
-            global_delay_factor=2,
+    for row in rows:
+        combined_text = row_text(row)
+        combined_lower = combined_text.lower()
+
+        if match_text.lower() not in combined_lower:
+            continue
+
+        if (
+            require_uson
+            and "uson" not in combined_lower
+        ):
+            continue
+
+        if (
+            exclude_text
+            and exclude_text.lower() in combined_lower
+        ):
+            continue
+
+        dhcp_range = format_dhcp_ranges(
+            row,
+            columns,
+            combined_text,
         )
 
-        hostname = connection.find_prompt().strip()
-        hostname = hostname.rstrip("#>").strip()
-        hostname = hostname or host
+        if not dhcp_range:
+            continue
 
-        network_output = get_command(
-            connection,
-            network_command,
-            timeout,
+        if (
+            dhcp_contains
+            and dhcp_contains.lower()
+            not in dhcp_range.lower()
+        ):
+            continue
+
+        network_column = columns.get(
+            "network",
+            "",
         )
 
-        range_output = get_command(
-            connection,
-            range_command,
-            timeout,
-        )
+        ip_range = ""
 
-        write_raw_output(
-            raw_dir,
-            hostname,
-            "show_network",
-            network_output,
-        )
-
-        write_raw_output(
-            raw_dir,
-            hostname,
-            "show_range",
-            range_output,
-        )
-
-        blocks = unique_networks(
-            network_blocks(network_output)
-        )
-
-        if not blocks:
-            print(
-                f"{hostname}: no CIDR networks parsed; "
-                "raw output saved.",
-                file=sys.stderr,
-            )
-            return results
-
-        for block in blocks:
-            cidr = block["cidr"]
-            summary_text = block["text"]
-
-            try:
-                detail_output = get_command(
-                    connection,
-                    f"show network {cidr}",
-                    timeout,
-                )
-
-            except Exception as exc:
-                detail_output = f"Detail query failed: {exc}"
-
-            combined_text = f"{summary_text}\n{detail_output}"
-
-            if not text_matches(
-                combined_text,
-                match_text,
-                require_uson,
-            ):
-                continue
-
-            gateway = extract_gateway(combined_text)
-
-            dhcp_ranges = find_dhcp_ranges(
-                range_output,
-                cidr,
-                detail_output,
+        if network_column:
+            ip_range = extract_cidr(
+                row.get(network_column, "")
             )
 
-            if not dhcp_ranges:
-                continue
+        if not ip_range:
+            ip_range = extract_cidr(
+                combined_text
+            )
 
-            notes = []
+        gateway = extract_gateway(
+            row,
+            columns,
+            combined_text,
+        )
 
-            if not gateway:
-                notes.append(
-                    "Gateway not found in Infoblox output"
-                )
+        notes = []
 
-            results.append(
-                {
-                    "Site Code": extract_site_code(
+        if not network_column:
+            notes.append(
+                "Network column auto-detected from row text"
+            )
+
+        if not gateway:
+            notes.append(
+                "Gateway not found"
+            )
+
+        output_row = dict(row)
+
+        output_row.update(
+            {
+                "Site Code": extract_site_code(
+                    row,
+                    columns,
+                    combined_text,
+                ),
+                "IP Range": ip_range,
+                "Gateway": gateway,
+                "DHCP Range": dhcp_range,
+                "Network Name or Comment": (
+                    extract_network_name(
+                        row,
+                        columns,
                         combined_text,
-                        site_code_pattern,
-                    ),
-                    "IP Range": cidr,
-                    "Gateway": gateway,
-                    "DHCP Range": "; ".join(dhcp_ranges),
-                    "Network Name or Comment": extract_network_label(
-                        combined_text
-                    ),
-                    "Network View": extract_network_view(
-                        combined_text
-                    ),
-                    "Infoblox Device": hostname,
-                    "Notes": "; ".join(notes),
-                }
-            )
-
-    except NetmikoAuthenticationException:
-        print(
-            f"{host}: authentication failure.",
-            file=sys.stderr,
+                    )
+                ),
+                "Network View": extract_network_view(
+                    row,
+                    columns,
+                    combined_text,
+                ),
+                "Filter Notes": "; ".join(notes),
+            }
         )
 
-    except NetmikoTimeoutException:
-        print(
-            f"{host}: connection timeout.",
-            file=sys.stderr,
-        )
+        output_rows.append(output_row)
 
-    except Exception as exc:
-        print(
-            f"{host}: collection failure: {exc}",
-            file=sys.stderr,
-        )
+    return columns, output_rows
 
-    finally:
-        if connection is not None:
-            connection.disconnect()
+def write_csv(filename, source_fields, rows):
+    output_fields = list(source_fields)
 
-    return results
+    for field in DERIVED_FIELDS:
+        if field not in output_fields:
+            output_fields.append(field)
 
-def write_csv(rows, filename):
     with open(
         filename,
         "w",
-        newline="",
         encoding="utf-8",
+        newline="",
     ) as csvfile:
         writer = csv.DictWriter(
             csvfile,
-            fieldnames=OUTPUT_FIELDS,
+            fieldnames=output_fields,
+            extrasaction="ignore",
         )
 
         writer.writeheader()
@@ -585,9 +557,8 @@ def write_csv(rows, filename):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "Read Infoblox hosts from a CSV, SSH to each host, "
-            "filter Azure Local DHCP networks, and report site "
-            "code, network, gateway, and DHCP range."
+            "Filter an Infoblox network/DHCP CSV locally "
+            "and create a filtered Azure Local DHCP report."
         )
     )
 
@@ -595,15 +566,9 @@ def main():
         "-o",
         "--output",
         default=DEFAULT_OUTPUT,
-        help=f"CSV output file; default: {DEFAULT_OUTPUT}",
-    )
-
-    parser.add_argument(
-        "--host-column",
-        default="",
         help=(
-            "CSV column containing Infoblox hostnames/IPs. "
-            "If omitted, the script auto-detects the column."
+            f"output CSV filename; "
+            f"default: {DEFAULT_OUTPUT}"
         ),
     )
 
@@ -611,7 +576,7 @@ def main():
         "--match",
         default="Azure Local",
         help=(
-            'text required in the network name or comment; '
+            'text required somewhere in each row; '
             'default: "Azure Local"'
         ),
     )
@@ -619,55 +584,34 @@ def main():
     parser.add_argument(
         "--require-uson",
         action="store_true",
-        help=(
-            "also require USON in the network name, comment, or detail"
-        ),
+        help="also require USON somewhere in each row",
     )
 
     parser.add_argument(
-        "--site-code-regex",
+        "--dhcp-contains",
         default="",
         help=(
-            "optional regex for site code; use capture group 1 when present"
+            "only include rows whose DHCP range "
+            "contains this text"
         ),
     )
 
     parser.add_argument(
-        "--network-command",
-        default="show network",
-        help="Infoblox command listing networks",
-    )
-
-    parser.add_argument(
-        "--range-command",
-        default="show range",
-        help="Infoblox command listing DHCP ranges",
-    )
-
-    parser.add_argument(
-        "--raw-dir",
-        default=DEFAULT_RAW_DIR,
+        "--exclude-text",
+        default="iDRAC",
         help=(
-            f"directory for raw Infoblox output; "
-            f"default: {DEFAULT_RAW_DIR}"
-        ),
-    )
-
-    parser.add_argument(
-        "--timeout",
-        type=int,
-        default=DEFAULT_TIMEOUT,
-        help=(
-            f"command read timeout in seconds; "
-            f"default: {DEFAULT_TIMEOUT}"
+            'exclude rows containing this text; '
+            'use "" to disable; default: "iDRAC"'
         ),
     )
 
     args = parser.parse_args()
 
-    csv_file = input("Infoblox CSV File: ").strip()
+    input_file = input(
+        "Infoblox CSV File: "
+    ).strip()
 
-    if not csv_file:
+    if not input_file:
         print(
             "No Infoblox CSV file was provided.",
             file=sys.stderr,
@@ -675,74 +619,44 @@ def main():
         sys.exit(1)
 
     try:
-        hosts, host_column = load_infoblox_hosts(
-            csv_file,
-            args.host_column,
+        fieldnames, rows = read_csv(
+            input_file
+        )
+
+        columns, filtered_rows = filter_rows(
+            fieldnames=fieldnames,
+            rows=rows,
+            match_text=args.match,
+            require_uson=args.require_uson,
+            dhcp_contains=args.dhcp_contains,
+            exclude_text=args.exclude_text,
+        )
+
+        write_csv(
+            args.output,
+            fieldnames,
+            filtered_rows,
         )
 
     except (OSError, ValueError) as exc:
         print(
-            f"Unable to load Infoblox CSV: {exc}",
+            f"Unable to process Infoblox CSV: {exc}",
             file=sys.stderr,
         )
         sys.exit(1)
 
-    if not hosts:
-        print(
-            "The Infoblox CSV did not contain any hostnames or IP addresses.",
-            file=sys.stderr,
-        )
-        sys.exit(1)
-
-    username = input("Infoblox user ID: ").strip()
-    password = getpass.getpass("Infoblox password: ")
-
-    raw_dir = Path(args.raw_dir)
-    raw_dir.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
+    print(f"\nInput rows: {len(rows)}")
     print(
-        f"Loaded {len(hosts)} unique Infoblox host(s) "
-        f"from column '{host_column}'."
+        "Matching rows with DHCP ranges: "
+        f"{len(filtered_rows)}"
     )
+    print(f"Output CSV: {args.output}")
+    print("Detected columns:")
 
-    all_rows = []
-
-    for host in hosts:
-        print(f"\nConnecting to {host}...")
-
-        all_rows.extend(
-            collect_device(
-                host=host,
-                username=username,
-                password=password,
-                match_text=args.match,
-                require_uson=args.require_uson,
-                site_code_pattern=args.site_code_regex,
-                network_command=args.network_command,
-                range_command=args.range_command,
-                timeout=args.timeout,
-                raw_dir=raw_dir,
-            )
+    for key, value in columns.items():
+        print(
+            f"  {key}: {value or 'not found'}"
         )
-
-    all_rows.sort(
-        key=lambda row: (
-            row["Site Code"],
-            row["IP Range"],
-        )
-    )
-
-    write_csv(
-        all_rows,
-        args.output,
-    )
-
-    print(f"\nMatching DHCP networks: {len(all_rows)}")
-    print(f"CSV report: {args.output}")
-    print(f"Raw command output: {raw_dir}")
 
 if __name__ == "__main__":
     main()
