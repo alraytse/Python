@@ -32,17 +32,89 @@ OUTPUT_FIELDS = [
     "Notes",
 ]
 
-def valid_ipv4(value):
-    try:
-        return ipaddress.ip_address(value).version == 4
-    except ValueError:
-        return False
+HOST_COLUMNS = [
+    "Infoblox IP",
+    "Infoblox Host",
+    "Infoblox Device",
+    "Management IP",
+    "IP Address",
+    "IP",
+    "Host",
+    "Hostname",
+    "Device",
+]
+
+def normalize_space(value):
+    return re.sub(r"\s+", " ", value or "").strip()
+
+def load_infoblox_hosts(filename, requested_column=""):
+    """Load unique Infoblox hosts from a CSV file."""
+    with open(
+        filename,
+        "r",
+        encoding="utf-8-sig",
+        newline="",
+    ) as csvfile:
+        reader = csv.DictReader(csvfile)
+
+        if not reader.fieldnames:
+            raise ValueError("The CSV file does not contain a header row.")
+
+        field_lookup = {
+            normalize_space(field).lower(): field
+            for field in reader.fieldnames
+            if field
+        }
+
+        if requested_column:
+            requested_key = requested_column.strip().lower()
+            host_column = field_lookup.get(requested_key)
+
+            if not host_column:
+                raise ValueError(
+                    f"Column '{requested_column}' was not found. "
+                    f"Available columns: {', '.join(reader.fieldnames)}"
+                )
+        else:
+            host_column = None
+
+            for candidate in HOST_COLUMNS:
+                host_column = field_lookup.get(candidate.lower())
+
+                if host_column:
+                    break
+
+            if not host_column:
+                raise ValueError(
+                    "No supported host column was found. Expected one of: "
+                    + ", ".join(HOST_COLUMNS)
+                )
+
+        hosts = []
+        seen = set()
+
+        for row in reader:
+            host = normalize_space(row.get(host_column, ""))
+
+            if not host:
+                continue
+
+            host_key = host.lower()
+
+            if host_key not in seen:
+                hosts.append(host)
+                seen.add(host_key)
+
+    return hosts, host_column
 
 def parse_ipv4(value):
     return ipaddress.ip_address(value)
 
-def normalize_space(value):
-    return re.sub(r"\s+", " ", value or "").strip()
+def valid_ipv4(value):
+    try:
+        return parse_ipv4(value).version == 4
+    except ValueError:
+        return False
 
 def extract_cidr(text):
     match = re.search(CIDR_RE, text, re.IGNORECASE)
@@ -61,7 +133,7 @@ def extract_cidr(text):
         return ""
 
 def network_blocks(output):
-    """Split show network output into blocks keyed by network CIDR."""
+    """Split network output into blocks keyed by network CIDR."""
     blocks = []
     current = None
 
@@ -203,7 +275,7 @@ def extract_site_code(text, custom_pattern=""):
     )
 
     if match:
-        return match.group(1).strip("-_ ")
+        return match.group(1).strip("-_")
 
     return "UNKNOWN"
 
@@ -422,13 +494,9 @@ def collect_device(
                 )
 
             except Exception as exc:
-                detail_output = (
-                    f"Detail query failed: {exc}"
-                )
+                detail_output = f"Detail query failed: {exc}"
 
-            combined_text = (
-                f"{summary_text}\n{detail_output}"
-            )
+            combined_text = f"{summary_text}\n{detail_output}"
 
             if not text_matches(
                 combined_text,
@@ -464,8 +532,8 @@ def collect_device(
                     "IP Range": cidr,
                     "Gateway": gateway,
                     "DHCP Range": "; ".join(dhcp_ranges),
-                    "Network Name or Comment": (
-                        extract_network_label(combined_text)
+                    "Network Name or Comment": extract_network_label(
+                        combined_text
                     ),
                     "Network View": extract_network_view(
                         combined_text
@@ -517,9 +585,9 @@ def write_csv(rows, filename):
 def main():
     parser = argparse.ArgumentParser(
         description=(
-            "SSH to Infoblox NIOS, filter Azure Local DHCP "
-            "networks, and report site code, network, gateway, "
-            "and DHCP range."
+            "Read Infoblox hosts from a CSV, SSH to each host, "
+            "filter Azure Local DHCP networks, and report site "
+            "code, network, gateway, and DHCP range."
         )
     )
 
@@ -527,8 +595,15 @@ def main():
         "-o",
         "--output",
         default=DEFAULT_OUTPUT,
+        help=f"CSV output file; default: {DEFAULT_OUTPUT}",
+    )
+
+    parser.add_argument(
+        "--host-column",
+        default="",
         help=(
-            f"CSV output file; default: {DEFAULT_OUTPUT}"
+            "CSV column containing Infoblox hostnames/IPs. "
+            "If omitted, the script auto-detects the column."
         ),
     )
 
@@ -536,7 +611,7 @@ def main():
         "--match",
         default="Azure Local",
         help=(
-            "text required in the network name or comment; "
+            'text required in the network name or comment; '
             'default: "Azure Local"'
         ),
     )
@@ -545,8 +620,7 @@ def main():
         "--require-uson",
         action="store_true",
         help=(
-            "also require USON in the network name, "
-            "comment, or detail"
+            "also require USON in the network name, comment, or detail"
         ),
     )
 
@@ -554,8 +628,7 @@ def main():
         "--site-code-regex",
         default="",
         help=(
-            "optional regex for site code; use capture "
-            "group 1 when present"
+            "optional regex for site code; use capture group 1 when present"
         ),
     )
 
@@ -592,19 +665,32 @@ def main():
 
     args = parser.parse_args()
 
-    hosts_input = input(
-        "Infoblox hostname/IP(s), comma delimited: "
-    ).strip()
+    csv_file = input("Infoblox CSV File: ").strip()
 
-    hosts = [
-        host.strip()
-        for host in hosts_input.split(",")
-        if host.strip()
-    ]
+    if not csv_file:
+        print(
+            "No Infoblox CSV file was provided.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    try:
+        hosts, host_column = load_infoblox_hosts(
+            csv_file,
+            args.host_column,
+        )
+
+    except (OSError, ValueError) as exc:
+        print(
+            f"Unable to load Infoblox CSV: {exc}",
+            file=sys.stderr,
+        )
+        sys.exit(1)
 
     if not hosts:
         print(
-            "No Infoblox hostnames or IP addresses were provided."
+            "The Infoblox CSV did not contain any hostnames or IP addresses.",
+            file=sys.stderr,
         )
         sys.exit(1)
 
@@ -617,9 +703,16 @@ def main():
         exist_ok=True,
     )
 
+    print(
+        f"Loaded {len(hosts)} unique Infoblox host(s) "
+        f"from column '{host_column}'."
+    )
+
     all_rows = []
 
     for host in hosts:
+        print(f"\nConnecting to {host}...")
+
         all_rows.extend(
             collect_device(
                 host=host,
