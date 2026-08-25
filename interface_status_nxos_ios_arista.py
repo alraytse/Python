@@ -51,7 +51,21 @@ def platform_matches(device_type, version_output):
     return False
 
 
+def normalize_interface_for_device(interface, device_type):
+    """Convert shorthand interface input to a device-appropriate name."""
+    interface = interface.strip()
+
+    if device_type == "arista_eos":
+        # Arista Ethernet ports are commonly entered as 12 or Eth12.
+        numeric_match = re.fullmatch(r"(?:eth(?:ernet)?)?(\d+)", interface, re.IGNORECASE)
+        if numeric_match:
+            return f"Ethernet{numeric_match.group(1)}"
+
+    return interface
+
 def get_interface_status(conn, interface, device_type):
+    interface = normalize_interface_for_device(interface, device_type)
+
     if device_type == "arista_eos":
         commands = [
             f"show interfaces {interface}",
@@ -139,21 +153,25 @@ def connect_and_check(hostname, username, password, interfaces):
 
             for interface in interfaces:
                 try:
+                    resolved_interface = normalize_interface_for_device(
+                        interface,
+                        device_type,
+                    )
                     status, _ = get_interface_status(
                         conn,
-                        interface,
+                        resolved_interface,
                         device_type,
                     )
 
                     result = {
                         "Switch": hostname,
-                        "Interface": interface,
+                        "Interface": resolved_interface,
                         "Status": status,
                     }
 
                     results.append(result)
                     print(
-                        f"{hostname:<30} {interface:<15} {status}"
+                        f"{hostname:<30} {resolved_interface:<15} {status}"
                     )
 
                 except Exception as exc:
