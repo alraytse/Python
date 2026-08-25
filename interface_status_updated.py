@@ -17,10 +17,20 @@ def get_interface_status(conn, interface):
     for cmd in commands:
         try:
             output = conn.send_command(cmd, read_timeout=30)
-            output_lower = output.lower()
+
+            # Remove terminal formatting that can interfere with matching.
+            clean_output = re.sub(r"\x1b\[[0-9;?]*[ -/]*[@-~]", "", output)
+            output_lower = clean_output.lower()
 
             # Do not treat unsupported-command output as a valid response.
-            if "invalid command" in output_lower or "error:" in output_lower:
+            invalid_markers = (
+                "invalid command",
+                "invalid input",
+                "incomplete command",
+                "unknown command",
+                "% error",
+            )
+            if any(marker in output_lower for marker in invalid_markers):
                 continue
 
             # Check administrative state before operational state.
@@ -33,20 +43,25 @@ def get_interface_status(conn, interface):
             elif "line protocol is down" in output_lower:
                 status = "Down"
             else:
-                # NX-OS commonly reports state as: "Ethernet1/2 is down (...)".
-                # Anchor the match to the interface line so "admin state is up"
-                # does not override an operational state of down.
+                # NX-OS commonly reports:
+                # "Ethernet1/2 is down (linkFlapErrDisabled)".
+                # Search the complete response instead of requiring the
+                # interface line to begin at column one.
                 interface_state_match = re.search(
-                    r"^\s*\S+\s+is\s+(?P<state>up|down)\b",
+                    r"(?:^|\n)\s*(?:interface\s+)?"
+                    r"(?:eth|ethernet|gi|gigabitethernet|te|"
+                    r"tengigabitethernet|po|port-channel)\S*"
+                    r"\s+is\s+(?P<state>up|down)\b",
                     output_lower,
-                    re.MULTILINE,
+                    re.IGNORECASE,
                 )
+
                 if interface_state_match:
                     status = interface_state_match.group("state").capitalize()
                 else:
                     status = "Unknown"
 
-            return status, output
+            return status, clean_output
 
         except Exception:
             continue
