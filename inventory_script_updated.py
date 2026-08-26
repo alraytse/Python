@@ -29,7 +29,7 @@ if MacLookup is not None:
 CSV_FILE = "inventory_report.csv"
 
 INTERFACE_RE = (
-    r"(?:Eth|Gi|Te|Po|Ethernet|GigabitEthernet|TenGigabitEthernet|"
+    r"(?:Vlan|Eth|Gi|Te|Po|Ethernet|GigabitEthernet|TenGigabitEthernet|"
     r"Port-channel)\S+"
 )
 
@@ -524,7 +524,16 @@ def collect_host(hostname, username, password):
     for iface, data in interfaces.items():
         desc = data["desc"]
         status_info = status_data.get(iface, {})
+
+        # NX-OS generally does not include SVI interfaces in
+        # "show interface status". Infer the VLAN ID from names such as
+        # Vlan20 so SVI rows still receive VLAN and VLAN Name values.
         vlan_id = status_info.get("vlan", "")
+        if not vlan_id and re.fullmatch(r"Vlan(?P<vlan_id>\d+)", iface, re.IGNORECASE):
+            vlan_id = re.fullmatch(
+                r"Vlan(?P<vlan_id>\d+)", iface, re.IGNORECASE
+            ).group("vlan_id")
+
         vlan_name = vlan_names.get(vlan_id, "") if vlan_id.isdigit() else ""
 
         switchport = switchport_data.get(
