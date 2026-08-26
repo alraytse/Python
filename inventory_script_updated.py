@@ -183,6 +183,27 @@ def parse_interface_description(output):
     return interfaces
 
 
+def parse_svi_details(output):
+    """Parse SVI IP address and status from show ip interface brief."""
+    svis = {}
+
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+
+        interface = parts[0]
+        if not re.fullmatch(r"Vlan\d+", interface, re.IGNORECASE):
+            continue
+
+        svis[normalize_interface_name(interface)] = {
+            "ip_address": parts[1],
+            "status": " ".join(parts[2:]),
+        }
+
+    return svis
+
+
 def append_vlan_values(existing, continuation):
     """Append a wrapped VLAN value without creating duplicate separators."""
     existing = existing.strip()
@@ -489,8 +510,25 @@ def collect_host(hostname, username, password):
             "show mac address-table",
             read_timeout=60,
         )
+        show_ip_interface_brief = conn.send_command(
+            "show ip interface brief",
+            read_timeout=60,
+        )
 
         interfaces = parse_interface_description(show_desc)
+        svi_data = parse_svi_details(show_ip_interface_brief)
+
+        # Some NX-OS outputs omit an SVI from interface descriptions. Add any
+        # SVI found in show ip interface brief so Vlan20/Vlan21 are retained.
+        for svi_interface in svi_data:
+            interfaces.setdefault(
+                svi_interface,
+                {
+                    "admin": "",
+                    "oper": "",
+                    "desc": "",
+                },
+            )
         interface_error_reasons = collect_interface_error_reasons(
             conn,
             interfaces.keys(),
@@ -524,6 +562,13 @@ def collect_host(hostname, username, password):
     for iface, data in interfaces.items():
         desc = data["desc"]
         status_info = status_data.get(iface, {})
+        svi_info = svi_data.get(
+            iface,
+            {
+                "ip_address": "",
+                "status": "",
+            },
+        )
 
         # NX-OS generally does not include SVI interfaces in
         # "show interface status". Infer the VLAN ID from names such as
@@ -568,6 +613,8 @@ def collect_host(hostname, username, password):
             "Device": hostname,
             "Management IP": mgmt_ip,
             "Interface": iface,
+            "SVI IP Address": svi_info["ip_address"],
+            "SVI Status": svi_info["status"],
             "Interface Status": status_info.get("status", ""),
             "Interface Error Reason": interface_error_reasons.get(iface, ""),
             "Admin Status": data["admin"],
@@ -614,6 +661,8 @@ def main():
         "Device",
         "Management IP",
         "Interface",
+        "SVI IP Address",
+        "SVI Status",
         "Interface Status",
         "Interface Error Reason",
         "Admin Status",
