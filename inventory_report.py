@@ -565,6 +565,10 @@ def collect_host(hostname, username, password):
     rows = []
 
     for iface, data in interfaces.items():
+        # Report only Cisco SVI interfaces such as Vlan20 and Vlan21.
+        if not re.fullmatch(r"Vlan\d+", iface, re.IGNORECASE):
+            continue
+
         desc = data["desc"]
         status_info = status_data.get(iface, {})
 
