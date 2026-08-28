@@ -29,7 +29,7 @@ if MacLookup is not None:
 CSV_FILE = "inventory_report.csv"
 
 INTERFACE_RE = (
-    r"(?:Eth|Gi|Te|Po|Ethernet|GigabitEthernet|TenGigabitEthernet|"
+    r"(?:Vlan|Eth|Gi|Te|Po|Ethernet|GigabitEthernet|TenGigabitEthernet|"
     r"Port-channel)\S+"
 )
 
@@ -183,9 +183,46 @@ def parse_interface_description(output):
     return interfaces
 
 
+def parse_svi_details(output):
+    """Parse SVI IP address and status from show ip interface brief."""
+    svis = {}
+
+    for line in output.splitlines():
+        parts = line.split()
+        if len(parts) < 3:
+            continue
+
+        interface = parts[0]
+        if not re.fullmatch(r"Vlan\d+", interface, re.IGNORECASE):
+            continue
+
+        svis[normalize_interface_name(interface)] = {
+            "ip_address": parts[1],
+            "status": " ".join(parts[2:]),
+        }
+
+    return svis
+
+
+def append_vlan_values(existing, continuation):
+    """Append a wrapped VLAN value without creating duplicate separators."""
+    existing = existing.strip()
+    continuation = continuation.strip()
+
+    if not continuation:
+        return existing
+
+    if not existing:
+        return continuation
+
+    return f"{existing.rstrip(',')},{continuation.lstrip(',')}"
+
+
 def parse_interface_switchport(output):
+    """Parse switchport data, including wrapped allowed-VLAN output lines."""
     results = {}
     current_interface = None
+    collecting_allowed_vlans = False
 
     for raw_line in output.splitlines():
         line = raw_line.strip()
@@ -205,10 +242,23 @@ def parse_interface_switchport(output):
                 "native_vlan": "",
                 "allowed_vlans": "",
             }
+            collecting_allowed_vlans = False
             continue
 
         if not current_interface:
             continue
+
+        # A new labeled field ends a wrapped allowed-VLAN section. Continuation
+        # lines from NX-OS normally contain only VLAN IDs, ranges, and commas.
+        if collecting_allowed_vlans:
+            if re.match(r"^[A-Za-z][^:]*:", line):
+                collecting_allowed_vlans = False
+            elif line:
+                results[current_interface]["allowed_vlans"] = append_vlan_values(
+                    results[current_interface]["allowed_vlans"],
+                    line,
+                )
+                continue
 
         mode_match = re.match(
             r"^Operational Mode:\s*(.+)$",
@@ -242,7 +292,7 @@ def parse_interface_switchport(output):
             continue
 
         allowed_vlan_match = re.match(
-            r"^Trunking VLANs Enabled:\s*(.+)$",
+            r"^Trunking VLANs Enabled:\s*(.*)$",
             line,
             re.IGNORECASE,
         )
@@ -250,8 +300,71 @@ def parse_interface_switchport(output):
             results[current_interface]["allowed_vlans"] = (
                 allowed_vlan_match.group(1).strip()
             )
+            collecting_allowed_vlans = True
+            continue
 
     return results
+
+
+def parse_vlan_names(output):
+    """Return a mapping of VLAN ID strings to VLAN names from NX-OS output."""
+    vlan_names = {}
+    vlan_statuses = (
+        r"active|act/unsup|act/lshut|suspended|suspend|shutdown|"
+        r"sus/lshut|act/unchecked"
+    )
+
+    for line in output.splitlines():
+        match = re.match(
+            rf"^\s*(?P<vlan_id>\d+)\s+"
+            rf"(?P<name>.*?)\s+(?P<status>{vlan_statuses})\s*",
+            line,
+            re.IGNORECASE,
+        )
+
+        if not match:
+            continue
+
+        vlan_id = match.group("vlan_id")
+        vlan_name = match.group("name").strip()
+        vlan_names[vlan_id] = vlan_name
+
+    return vlan_names
+
+
+def parse_interface_error_reason(output):
+    """Extract the NX-OS interface error reason from detailed interface output."""
+    for line in output.splitlines():
+        match = re.search(
+            r"\bis\s+(?:up|down)\s+\((?P<reason>[^)]+)\)",
+            line,
+            re.IGNORECASE,
+        )
+        if match:
+            return match.group("reason").strip()
+
+    return ""
+
+
+def collect_interface_error_reasons(conn, interfaces):
+    """Collect detailed error reasons without failing the host for one bad command."""
+    error_reasons = {}
+
+    for interface in interfaces:
+        try:
+            output = conn.send_command(
+                f"show interface {interface}",
+                read_timeout=30,
+            )
+            error_reasons[interface] = parse_interface_error_reason(output)
+        except Exception as exc:
+            print(
+                f"{conn.host} {interface}: unable to collect interface reason: {exc}",
+                file=sys.stderr,
+            )
+            error_reasons[interface] = ""
+
+    return error_reasons
 
 
 def parse_mac_table(output):
@@ -367,6 +480,13 @@ def collect_host(hostname, username, password):
         "username": username,
         "password": password,
         "fast_cli": False,
+        # Equivalent Netmiko/Paramiko behavior to:
+        # ssh -o HostKeyAlgorithms=+ssh-rsa
+        # Disable RSA-SHA2 host-key negotiation so legacy switches can
+        # negotiate their ssh-rsa host key.
+        "disabled_algorithms": {
+            "keys": ["rsa-sha2-512", "rsa-sha2-256"],
+        },
     }
 
     conn = None
@@ -387,9 +507,36 @@ def collect_host(hostname, username, password):
             "show interface switchport",
             read_timeout=60,
         )
+        show_vlan = conn.send_command(
+            "show vlan brief",
+            read_timeout=60,
+        )
         show_mac = conn.send_command(
             "show mac address-table",
             read_timeout=60,
+        )
+        show_ip_interface_brief = conn.send_command(
+            "show ip interface brief",
+            read_timeout=60,
+        )
+
+        interfaces = parse_interface_description(show_desc)
+        svi_data = parse_svi_details(show_ip_interface_brief)
+
+        # Some NX-OS outputs omit an SVI from interface descriptions. Add any
+        # SVI found in show ip interface brief so Vlan20/Vlan21 are retained.
+        for svi_interface in svi_data:
+            interfaces.setdefault(
+                svi_interface,
+                {
+                    "admin": "",
+                    "oper": "",
+                    "desc": "",
+                },
+            )
+        interface_error_reasons = collect_interface_error_reasons(
+            conn,
+            interfaces.keys(),
         )
 
         mgmt_ip = conn.host
@@ -410,15 +557,35 @@ def collect_host(hostname, username, password):
         if conn:
             conn.disconnect()
 
-    interfaces = parse_interface_description(show_desc)
     status_data = parse_interface_status(show_status)
     switchport_data = parse_interface_switchport(show_switchport)
+    vlan_names = parse_vlan_names(show_vlan)
     mac_data = parse_mac_table(show_mac)
 
     rows = []
 
     for iface, data in interfaces.items():
         desc = data["desc"]
+        status_info = status_data.get(iface, {})
+        svi_info = svi_data.get(
+            iface,
+            {
+                "ip_address": "",
+                "status": "",
+            },
+        )
+
+        # NX-OS generally does not include SVI interfaces in
+        # "show interface status". Infer the VLAN ID from names such as
+        # Vlan20 so SVI rows still receive VLAN and VLAN Name values.
+        vlan_id = status_info.get("vlan", "")
+        if not vlan_id and re.fullmatch(r"Vlan(?P<vlan_id>\d+)", iface, re.IGNORECASE):
+            vlan_id = re.fullmatch(
+                r"Vlan(?P<vlan_id>\d+)", iface, re.IGNORECASE
+            ).group("vlan_id")
+
+        vlan_name = vlan_names.get(vlan_id, "") if vlan_id.isdigit() else ""
+
         switchport = switchport_data.get(
             iface,
             {
@@ -451,10 +618,14 @@ def collect_host(hostname, username, password):
             "Device": hostname,
             "Management IP": mgmt_ip,
             "Interface": iface,
-            "Interface Status": status_data.get(iface, {}).get("status", ""),
+            "SVI IP Address": svi_info["ip_address"],
+            "SVI Status": svi_info["status"],
+            "Interface Status": status_info.get("status", ""),
+            "Interface Error Reason": interface_error_reasons.get(iface, ""),
             "Admin Status": data["admin"],
             "Operational Status": data["oper"],
-            "VLAN": status_data.get(iface, {}).get("vlan", ""),
+            "VLAN": vlan_id,
+            "VLAN Name": vlan_name,
             "Mode": switchport["mode"],
             "Native VLAN": switchport["native_vlan"],
             "Allowed VLANs": switchport["allowed_vlans"],
@@ -495,10 +666,14 @@ def main():
         "Device",
         "Management IP",
         "Interface",
+        "SVI IP Address",
+        "SVI Status",
         "Interface Status",
+        "Interface Error Reason",
         "Admin Status",
         "Operational Status",
         "VLAN",
+        "VLAN Name",
         "Mode",
         "Native VLAN",
         "Allowed VLANs",
