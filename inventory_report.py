@@ -138,7 +138,7 @@ def parse_interface_status(output):
         match = re.match(
             rf"^\s*(?P<interface>{INTERFACE_RE})\s+"
             rf"(?:(?P<name>.*?)\s+)?"
-            r"(?P<status>connected|notconnect|disabled|suspended|"
+            r"(?P<status>connected|notconnect|notconnec|disabled|suspended|"
             r"err-disabled|xcvrd|xcvr|unknown)\s+"
             r"(?P<vlan>\S+)",
             line,
@@ -568,13 +568,15 @@ def collect_host(hostname, username, password):
         desc = data["desc"]
         status_info = status_data.get(iface, {})
 
-        # Exclude active interfaces: administratively up and either
-        # operationally up or reported as connected by show interface status.
-        admin_status = data["admin"].strip().lower()
+        # Keep only interfaces that are operationally down or not connected.
+        # NX-OS may display notconnect as the abbreviated notconnec.
         operational_status = data["oper"].strip().lower()
         interface_status = status_info.get("status", "").strip().lower()
-        if admin_status == "up" and (
-            operational_status == "up" or interface_status == "connected"
+        down_statuses = {"down", "notconnect", "notconnec"}
+        not_connected_statuses = {"notconnect", "notconnec"}
+        if (
+            operational_status not in down_statuses
+            and interface_status not in not_connected_statuses
         ):
             continue
         svi_info = svi_data.get(
