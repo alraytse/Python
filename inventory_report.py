@@ -565,6 +565,13 @@ def collect_host(hostname, username, password):
     rows = []
 
     for iface, data in interfaces.items():
+        # Exclude interfaces that are administratively and operationally up.
+        if (
+            data["admin"].strip().lower() == "up"
+            and data["oper"].strip().lower() == "up"
+        ):
+            continue
+
         desc = data["desc"]
         status_info = status_data.get(iface, {})
         svi_info = svi_data.get(
