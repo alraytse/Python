@@ -137,6 +137,7 @@ def get_mac_info(connection, vlan, base_oid, oui_registry):
             mac_companies.append(company)
 
         return {
+            "MAC_Count": str(len(mac_addresses)),
             "MAC_Address": "; ".join(mac_addresses),
             "MAC_OUI": "; ".join(mac_ouis),
             "MAC_OID": "; ".join(mac_oids),
@@ -146,6 +147,7 @@ def get_mac_info(connection, vlan, base_oid, oui_registry):
     except Exception as error:
         print(f"MAC lookup failed for VLAN {vlan}: {error}")
         return {
+            "MAC_Count": "0",
             "MAC_Address": "",
             "MAC_OUI": "",
             "MAC_OID": "",
@@ -226,6 +228,7 @@ def process_switch(device, base_oid, oui_registry):
                 "VLAN_Name": vlan_info["name"],
                 "SVI_IP": svi_ip,
                 "SVI_Description": svi_description,
+                "MAC_Count": mac_info["MAC_Count"],
                 "MAC_Address": mac_info["MAC_Address"],
                 "MAC_OUI": mac_info["MAC_OUI"],
                 "MAC_OID": mac_info["MAC_OID"],
@@ -313,6 +316,7 @@ def write_csv(results, csv_file):
         "VLAN_Name",
         "SVI_IP",
         "SVI_Description",
+        "MAC_Count",
         "MAC_Address",
         "MAC_OUI",
         "MAC_OID",
@@ -342,6 +346,7 @@ def display_results(results):
                 f"{'VLAN':<8}"
                 f"{'VLAN Name':<20}"
                 f"{'SVI IP':<20}"
+                f"{'MACs':<6}"
                 f"{'MAC Address':<24}"
                 f"{'OUI':<12}"
                 f"{'Company':<32}"
@@ -353,6 +358,7 @@ def display_results(results):
             f"{row['VLAN']:<8}"
             f"{row['VLAN_Name']:<20}"
             f"{row['SVI_IP']:<20}"
+            f"{row['MAC_Count']:<6}"
             f"{row['MAC_Address']:<24}"
             f"{row['MAC_OUI']:<12}"
             f"{row['MAC_Company']:<32}"
