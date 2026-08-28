@@ -94,6 +94,65 @@ def parse_mac_table(output):
     return entries
 
 
+def parse_arp_table(output):
+    """Return ARP entries grouped by VLAN from NX-OS output."""
+    mac_pattern = (
+        r"[0-9a-fA-F]{4}(?:[.:-][0-9a-fA-F]{4}){2}|"
+        r"[0-9a-fA-F]{12}"
+    )
+    vlan_pattern = r"\b[Vv]lan(\d+)\b"
+    arp_entries = {}
+
+    for line in output.splitlines():
+        mac_match = re.search(mac_pattern, line)
+        vlan_match = re.search(vlan_pattern, line)
+
+        if mac_match and vlan_match:
+            vlan = vlan_match.group(1)
+            mac = format_mac(mac_match.group(0))
+            arp_entries.setdefault(vlan, set()).add(mac)
+
+    return arp_entries
+
+
+def get_arp_table(connection):
+    try:
+        output = connection.send_command(
+            "show ip arp",
+            read_timeout=30,
+        )
+        return parse_arp_table(output), True
+    except Exception as error:
+        print(f"ARP lookup failed: {error}")
+        return {}, False
+
+
+def check_mac_arp(mac_info, vlan, arp_entries, arp_available):
+    macs = [
+        mac.strip()
+        for mac in mac_info["MAC_Address"].split(";")
+        if mac.strip()
+    ]
+
+    if not arp_available:
+        return "ARP_UNAVAILABLE", ""
+
+    if not macs:
+        return "NO_MACS", ""
+
+    vlan_arp_macs = arp_entries.get(str(vlan), set())
+    missing_macs = [
+        mac
+        for mac in macs
+        if mac not in vlan_arp_macs
+    ]
+
+    if missing_macs:
+        return "MISSING_ARP", "; ".join(missing_macs)
+
+    return "PASS", ""
+
+
 def get_mac_info(connection, vlan, base_oid, oui_registry):
     try:
         output = connection.send_command(
@@ -209,6 +268,7 @@ def process_switch(device, base_oid, oui_registry):
             read_timeout=30,
         )
         vlans = parse_vlans(vlan_output)
+        arp_entries, arp_available = get_arp_table(connection)
         print(f"{hostname}: Found {len(vlans)} VLANs")
 
         for vlan_info in vlans:
@@ -218,6 +278,12 @@ def process_switch(device, base_oid, oui_registry):
                 vlan_id,
                 base_oid,
                 oui_registry,
+            )
+            arp_check, arp_missing_macs = check_mac_arp(
+                mac_info,
+                vlan_id,
+                arp_entries,
+                arp_available,
             )
             svi_description, svi_ip = get_svi_info(connection, vlan_id)
             is_root = check_root(connection, vlan_id)
@@ -233,6 +299,8 @@ def process_switch(device, base_oid, oui_registry):
                 "MAC_OUI": mac_info["MAC_OUI"],
                 "MAC_OID": mac_info["MAC_OID"],
                 "MAC_Company": mac_info["MAC_Company"],
+                "ARP_Check": arp_check,
+                "ARP_Missing_MACs": arp_missing_macs,
                 "Root_Bridge": "YES" if is_root else "NO",
             })
 
@@ -321,6 +389,8 @@ def write_csv(results, csv_file):
         "MAC_OUI",
         "MAC_OID",
         "MAC_Company",
+        "ARP_Check",
+        "ARP_Missing_MACs",
         "Root_Bridge",
     ]
 
@@ -350,6 +420,7 @@ def display_results(results):
                 f"{'MAC Address':<24}"
                 f"{'OUI':<12}"
                 f"{'Company':<32}"
+                f"{'ARP Check':<16}"
                 f"{'Root':<8}"
             )
             print("-" * 240)
@@ -362,10 +433,13 @@ def display_results(results):
             f"{row['MAC_Address']:<24}"
             f"{row['MAC_OUI']:<12}"
             f"{row['MAC_Company']:<32}"
+            f"{row['ARP_Check']:<16}"
             f"{row['Root_Bridge']:<8}"
         )
         if row["MAC_OID"]:
             print(f"{'':<8}{'MAC OID: ' + row['MAC_OID']}")
+        if row["ARP_Missing_MACs"]:
+            print(f"{'':<8}{'MACs missing ARP: ' + row['ARP_Missing_MACs']}")
         if row["SVI_Description"]:
             print(f"{'':<8}{'SVI Description: ' + row['SVI_Description']}")
 
