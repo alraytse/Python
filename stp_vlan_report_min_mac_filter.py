@@ -14,8 +14,8 @@ from netmiko import ConnectHandler
 CSV_FILE = "stp_vlan_report.csv"
 MAC_OID_BASE = "1.3.6.1.2.1.17.4.3.1.1"
 IEEE_OUI_URL = "https://standards-oui.ieee.org/oui/oui.csv"
-DEFAULT_MIN_MAC_COUNT = 3
-DEFAULT_MIN_ARP_COUNT = 3
+DEFAULT_MAX_MAC_COUNT = 3
+DEFAULT_MAX_ARP_COUNT = 3
 
 
 def parse_vlans(output):
@@ -264,8 +264,8 @@ def process_switch(
     device,
     base_oid,
     oui_registry,
-    min_mac_count,
-    min_arp_count,
+    max_mac_count,
+    max_arp_count,
 ):
     results = []
     connection = None
@@ -294,7 +294,7 @@ def process_switch(
             mac_count = int(mac_info["MAC_Count"])
             arp_count = get_arp_count(arp_entries, vlan_id)
 
-            if mac_count < min_mac_count or arp_count < min_arp_count:
+            if mac_count > max_mac_count or arp_count > max_arp_count:
                 continue
 
             arp_check, arp_missing_macs = check_mac_arp(
@@ -420,12 +420,12 @@ def write_csv(results, csv_file):
         writer.writerows(results)
 
 
-def display_results(results, min_mac_count, min_arp_count):
+def display_results(results, max_mac_count, max_arp_count):
     print("\n" + "=" * 240)
     print(
         "VLAN / SVI / MAC / ARP / OID / COMPANY / "
         "SPANNING TREE ROOT REPORT "
-        f"(MAC COUNT >= {min_mac_count}, ARP COUNT >= {min_arp_count})"
+        f"(MAC COUNT <= {max_mac_count}, ARP COUNT <= {max_arp_count})"
     )
     print("=" * 240)
 
@@ -485,7 +485,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description=(
             "Collect VLAN, SVI, MAC OID, OUI, company, and STP root data "
-            "for VLANs meeting minimum MAC and ARP count filters."
+            "for VLANs meeting maximum MAC and ARP count filters."
         )
     )
     parser.add_argument(
@@ -499,21 +499,21 @@ def build_parser():
         help=f"MAC OID base. Default: {MAC_OID_BASE}",
     )
     parser.add_argument(
-        "--min-mac-count",
+        "--max-mac-count",
         type=int,
-        default=DEFAULT_MIN_MAC_COUNT,
+        default=DEFAULT_MAX_MAC_COUNT,
         help=(
-            "Only include VLANs with at least this many MAC addresses. "
-            f"Default: {DEFAULT_MIN_MAC_COUNT}"
+            "Only include VLANs with at most this many MAC addresses. "
+            f"Default: {DEFAULT_MAX_MAC_COUNT}"
         ),
     )
     parser.add_argument(
-        "--min-arp-count",
+        "--max-arp-count",
         type=int,
-        default=DEFAULT_MIN_ARP_COUNT,
+        default=DEFAULT_MAX_ARP_COUNT,
         help=(
-            "Only include VLANs with at least this many distinct ARP entries. "
-            f"Default: {DEFAULT_MIN_ARP_COUNT}"
+            "Only include VLANs with at most this many distinct ARP entries. "
+            f"Default: {DEFAULT_MAX_ARP_COUNT}"
         ),
     )
     parser.add_argument(
@@ -531,12 +531,12 @@ def build_parser():
 def main():
     args = build_parser().parse_args()
 
-    if args.min_mac_count < 0:
-        print("Error: --min-mac-count cannot be negative.")
+    if args.max_mac_count < 0:
+        print("Error: --max-mac-count cannot be negative.")
         return 2
 
-    if args.min_arp_count < 0:
-        print("Error: --min-arp-count cannot be negative.")
+    if args.max_arp_count < 0:
+        print("Error: --max-arp-count cannot be negative.")
         return 2
 
     hosts = input(
@@ -570,8 +570,8 @@ def main():
                 device,
                 args.mac_oid_base,
                 oui_registry,
-                args.min_mac_count,
-                args.min_arp_count,
+                args.max_mac_count,
+                args.max_arp_count,
             )
         )
 
@@ -584,8 +584,8 @@ def main():
 
     display_results(
         all_results,
-        args.min_mac_count,
-        args.min_arp_count,
+        args.max_mac_count,
+        args.max_arp_count,
     )
     write_csv(all_results, args.csv_file)
     print(f"\nCSV report saved to: {args.csv_file}")
