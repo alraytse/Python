@@ -8,6 +8,7 @@ from netmiko import ConnectHandler
 
 CSV_FILE = "stp_vlan_report.csv"
 MAX_MAC_ADDRESSES = 3
+IFNAME_OID_BASE = "1.3.6.1.2.1.31.1.1.1.1"
 MAC_PATTERN = re.compile(
     r"(?i)(?:[0-9a-f]{4}\.){2}[0-9a-f]{4}|"
     r"(?:[0-9a-f]{2}[:-]){5}[0-9a-f]{2}"
@@ -67,6 +68,32 @@ def get_svi_info(connection, vlan):
         return "", ""
 
 
+def get_svi_snmp_oid(connection, vlan):
+    """Return the IF-MIB ifName OID for the SVI, or an empty string."""
+    try:
+        output = connection.send_command(
+            "show interface snmp-ifindex",
+            read_timeout=30,
+        )
+
+        svi_name = f"vlan{vlan}".lower()
+
+        for line in output.splitlines():
+            fields = line.split()
+
+            if len(fields) < 2:
+                continue
+
+            if fields[0].lower() == svi_name and fields[-1].isdigit():
+                if_index = fields[-1]
+                return f"{IFNAME_OID_BASE}.{if_index}"
+
+    except Exception as e:
+        print(f"Unable to get SNMP OID for VLAN {vlan}: {e}")
+
+    return ""
+
+
 def get_mac_count(connection, vlan):
     try:
         output = connection.send_command(
@@ -119,6 +146,7 @@ def process_switch(device):
 
             is_root = check_root(conn, vlan_id)
             svi_description, svi_ip = get_svi_info(conn, vlan_id)
+            svi_oid = get_svi_snmp_oid(conn, vlan_id)
 
             results.append({
                 "Device": hostname,
@@ -127,6 +155,7 @@ def process_switch(device):
                 "MAC_Count": mac_count,
                 "SVI_IP": svi_ip,
                 "SVI_Description": svi_description,
+                "OID": svi_oid,
                 "Root_Bridge": "YES" if is_root else "NO",
             })
 
@@ -148,6 +177,7 @@ def write_csv(results):
         "MAC_Count",
         "SVI_IP",
         "SVI_Description",
+        "OID",
         "Root_Bridge",
     ]
 
@@ -158,9 +188,9 @@ def write_csv(results):
 
 
 def display_results(results):
-    print("\n" + "=" * 190)
-    print("VLAN / SVI REPORT - VLANs WITH 3 OR FEWER LEARNED MAC ADDRESSES")
-    print("=" * 190)
+    print("\n" + "=" * 220)
+    print("VLAN / SVI REPORT - VLANS WITH 3 OR FEWER LEARNED MAC ADDRESSES")
+    print("=" * 220)
 
     current_device = ""
 
@@ -169,23 +199,25 @@ def display_results(results):
             current_device = row["Device"]
 
             print(f"\nSwitch: {current_device}")
-            print("-" * 190)
+            print("-" * 220)
             print(
                 f"{'VLAN':<8}"
                 f"{'VLAN Name':<30}"
                 f"{'MACs':<8}"
                 f"{'SVI IP':<25}"
-                f"{'SVI Description':<90}"
+                f"{'SVI Description':<75}"
+                f"{'OID':<35}"
                 f"{'Root':<10}"
             )
-            print("-" * 190)
+            print("-" * 220)
 
         print(
             f"{row['VLAN']:<8}"
             f"{row['VLAN_Name']:<30}"
             f"{row['MAC_Count']:<8}"
             f"{row['SVI_IP']:<25}"
-            f"{row['SVI_Description']:<90}"
+            f"{row['SVI_Description']:<75}"
+            f"{row['OID']:<35}"
             f"{row['Root_Bridge']:<10}"
         )
 
@@ -195,11 +227,12 @@ def display_results(results):
         if row["Root_Bridge"] == "YES"
     )
 
-    print("\n" + "=" * 190)
+    print("\n" + "=" * 220)
     print(f"Total VLANs/SVIs Displayed : {len(results)}")
     print(f"MAC address threshold      : {MAX_MAC_ADDRESSES} or fewer")
+    print(f"SNMP OID                   : IF-MIB::ifName.<ifIndex>")
     print(f"Total Root VLANs            : {root_count}")
-    print("=" * 190)
+    print("=" * 220)
 
 
 def main():
