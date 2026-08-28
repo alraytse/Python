@@ -306,9 +306,10 @@ def parse_interface_switchport(output):
     return results
 
 
-def parse_vlan_names(output):
-    """Return a mapping of VLAN ID strings to VLAN names from NX-OS output."""
-    vlan_names = {}
+def parse_vlan_inventory(output):
+    """Return VLAN names, statuses, and configured ports from NX-OS output."""
+    vlan_inventory = {}
+    current_vlan_id = None
     vlan_statuses = (
         r"active|act/unsup|act/lshut|suspended|suspend|shutdown|"
         r"sus/lshut|act/unchecked"
@@ -317,20 +318,97 @@ def parse_vlan_names(output):
     for line in output.splitlines():
         match = re.match(
             rf"^\s*(?P<vlan_id>\d+)\s+"
-            rf"(?P<name>.*?)\s+(?P<status>{vlan_statuses})\s*",
+            rf"(?P<name>.*?)\s+(?P<status>{vlan_statuses})"
+            rf"(?:\s+(?P<ports>.*))?\s*$",
             line,
             re.IGNORECASE,
         )
 
-        if not match:
+        if match:
+            current_vlan_id = match.group("vlan_id")
+            vlan_inventory[current_vlan_id] = {
+                "name": match.group("name").strip(),
+                "status": match.group("status").strip(),
+                "ports": (match.group("ports") or "").strip(),
+            }
             continue
 
-        vlan_id = match.group("vlan_id")
-        vlan_name = match.group("name").strip()
-        vlan_names[vlan_id] = vlan_name
+        # show vlan brief can wrap the port list onto indented lines.
+        if (
+            current_vlan_id
+            and line.strip()
+            and re.match(
+                rf"^\s*(?:{INTERFACE_RE})",
+                line,
+                re.IGNORECASE,
+            )
+        ):
+            continuation = line.strip()
+            existing_ports = vlan_inventory[current_vlan_id]["ports"]
+            vlan_inventory[current_vlan_id]["ports"] = (
+                f"{existing_ports},{continuation}"
+                if existing_ports
+                else continuation
+            )
 
-    return vlan_names
+    return vlan_inventory
 
+
+def parse_vlan_names(output):
+    """Return a mapping of VLAN ID strings to VLAN names."""
+    return {
+        vlan_id: data["name"]
+        for vlan_id, data in parse_vlan_inventory(output).items()
+    }
+
+
+def vlan_expression_contains(expression, vlan_id):
+    """Return whether a VLAN ID is included in an access/trunk expression."""
+    expression = expression.strip().lower()
+    if not expression or expression in {"none", "--"}:
+        return False
+    if expression == "all":
+        return True
+
+    target = int(vlan_id)
+    for token in re.split(r"[,\s]+", expression):
+        token = token.strip().strip("()")
+        if not token:
+            continue
+
+        if token.isdigit() and int(token) == target:
+            return True
+
+        range_match = re.fullmatch(r"(\d+)\s*-\s*(\d+)", token)
+        if range_match:
+            start = int(range_match.group(1))
+            end = int(range_match.group(2))
+            if min(start, end) <= target <= max(start, end):
+                return True
+
+    return False
+
+
+def find_configured_vlan_ids(vlan_inventory, switchport_data):
+    """Find VLANs referenced by configured switchports or VLAN port lists."""
+    configured_vlan_ids = set()
+
+    for vlan_id, vlan_data in vlan_inventory.items():
+        if vlan_data["ports"]:
+            configured_vlan_ids.add(vlan_id)
+
+        for switchport in switchport_data.values():
+            if (
+                vlan_expression_contains(switchport["native_vlan"], vlan_id)
+                or vlan_expression_contains(
+                    switchport["allowed_vlans"],
+                    vlan_id,
+                )
+            ):
+                configured_vlan_ids.add(vlan_id)
+                break
+
+    return configured_vlan_ids
 
 def parse_interface_error_reason(output):
     """Extract the NX-OS interface error reason from detailed interface output."""
@@ -402,6 +480,26 @@ def parse_mac_table(output):
         mac_data[interface]["addresses"].append(mac_address)
 
     return mac_data
+
+
+def parse_mac_vlan_counts(output):
+    """Return learned MAC counts keyed by VLAN ID."""
+    vlan_counts = {}
+    mac_pattern = r"\b[0-9a-f]{4}\.[0-9a-f]{4}\.[0-9a-f]{4}\b"
+
+    for line in output.splitlines():
+        mac_match = re.search(mac_pattern, line, re.IGNORECASE)
+        if not mac_match:
+            continue
+
+        vlan_match = re.match(r"^\s*\*?\s*(?P<vlan_id>\d+)\b", line)
+        if not vlan_match:
+            continue
+
+        vlan_id = vlan_match.group("vlan_id")
+        vlan_counts[vlan_id] = vlan_counts.get(vlan_id, 0) + 1
+
+    return vlan_counts
 
 
 def lookup_mac_vendor(mac_address):
@@ -559,30 +657,109 @@ def collect_host(hostname, username, password):
 
     status_data = parse_interface_status(show_status)
     switchport_data = parse_interface_switchport(show_switchport)
-    vlan_names = parse_vlan_names(show_vlan)
+    vlan_inventory = parse_vlan_inventory(show_vlan)
     mac_data = parse_mac_table(show_mac)
+    mac_vlan_counts = parse_mac_vlan_counts(show_mac)
+    configured_vlan_ids = find_configured_vlan_ids(
+        vlan_inventory,
+        switchport_data,
+    )
+
+    svi_interfaces = {
+        interface
+        for interface in set(interfaces) | set(svi_data)
+        if re.fullmatch(r"Vlan\d+", interface, re.IGNORECASE)
+    }
+    svi_vlan_ids = {
+        re.fullmatch(r"Vlan(?P<vlan_id>\d+)", interface, re.IGNORECASE)
+        .group("vlan_id")
+        for interface in svi_interfaces
+    }
 
     rows = []
 
-    for iface, data in interfaces.items():
-        # Report only Cisco SVI interfaces such as Vlan20 and Vlan21.
-        if not re.fullmatch(r"Vlan\d+", iface, re.IGNORECASE):
+    def empty_row():
+        return {
+            "Device": hostname,
+            "Management IP": mgmt_ip,
+            "Record Type": "",
+            "Interface": "",
+            "SVI IP Address": "",
+            "SVI Status": "",
+            "Interface Status": "",
+            "Interface Error Reason": "",
+            "Admin Status": "",
+            "Operational Status": "",
+            "VLAN": "",
+            "VLAN Name": "",
+            "Mode": "",
+            "Native VLAN": "",
+            "Allowed VLANs": "",
+            "Circuit Vendor": "",
+            "Circuit IDs": "",
+            "Circuit Type": "",
+            "Circuit Directly Attached": "",
+            "Matched Keywords": "",
+            "Description": "",
+            "MAC Count": 0,
+            "MAC Addresses": "",
+            "MAC Vendor": "",
+            "Device Type": "",
+            "Notes": "",
+        }
+
+    # Report VLANs only when there is no SVI, no configured port membership,
+    # and no learned MAC address for the VLAN.
+    for vlan_id, vlan_data in sorted(
+        vlan_inventory.items(),
+        key=lambda item: int(item[0]),
+    ):
+        if vlan_id in svi_vlan_ids:
+            continue
+        if vlan_id in configured_vlan_ids:
+            continue
+        if mac_vlan_counts.get(vlan_id, 0) > 0:
             continue
 
-        desc = data["desc"]
+        row = empty_row()
+        row.update(
+            {
+                "Record Type": "Unused VLAN",
+                "VLAN": vlan_id,
+                "VLAN Name": vlan_data["name"],
+                "MAC Count": 0,
+                "Device Type": "VLAN",
+                "Notes": (
+                    "No SVI, no configured port membership, "
+                    "and no learned MAC addresses"
+                ),
+            }
+        )
+        rows.append(row)
+
+    # Report SVIs when their VLAN has no configured port membership and no
+    # learned MAC addresses. This includes Vlan20/Vlan21 when unused.
+    for iface in sorted(svi_interfaces, key=lambda value: int(value[4:])):
+        vlan_id = re.fullmatch(
+            r"Vlan(?P<vlan_id>\d+)",
+            iface,
+            re.IGNORECASE,
+        ).group("vlan_id")
+
+        if vlan_id in configured_vlan_ids:
+            continue
+        if mac_vlan_counts.get(vlan_id, 0) > 0:
+            continue
+
+        interface_data = interfaces.get(
+            iface,
+            {
+                "admin": "",
+                "oper": "",
+                "desc": "",
+            },
+        )
         status_info = status_data.get(iface, {})
-
-        # Keep only interfaces that are operationally down or not connected.
-        # NX-OS may display notconnect as the abbreviated notconnec.
-        operational_status = data["oper"].strip().lower()
-        interface_status = status_info.get("status", "").strip().lower()
-        down_statuses = {"down", "notconnect", "notconnec"}
-        not_connected_statuses = {"notconnect", "notconnec"}
-        if (
-            operational_status not in down_statuses
-            and interface_status not in not_connected_statuses
-        ):
-            continue
         svi_info = svi_data.get(
             iface,
             {
@@ -590,27 +767,6 @@ def collect_host(hostname, username, password):
                 "status": "",
             },
         )
-
-        # NX-OS generally does not include SVI interfaces in
-        # "show interface status". Infer the VLAN ID from names such as
-        # Vlan20 so SVI rows still receive VLAN and VLAN Name values.
-        vlan_id = status_info.get("vlan", "")
-        if not vlan_id and re.fullmatch(r"Vlan(?P<vlan_id>\d+)", iface, re.IGNORECASE):
-            vlan_id = re.fullmatch(
-                r"Vlan(?P<vlan_id>\d+)", iface, re.IGNORECASE
-            ).group("vlan_id")
-
-        vlan_name = vlan_names.get(vlan_id, "") if vlan_id.isdigit() else ""
-
-        switchport = switchport_data.get(
-            iface,
-            {
-                "mode": "",
-                "native_vlan": "",
-                "allowed_vlans": "",
-            },
-        )
-
         mac_info = mac_data.get(
             iface,
             {
@@ -618,46 +774,35 @@ def collect_host(hostname, username, password):
                 "addresses": [],
             },
         )
-        mac_count = mac_info["count"]
-        mac_list = mac_info["addresses"]
-        mac_addresses = ", ".join(mac_list) if 0 < mac_count <= 2 else ""
-        mac_vendors = []
-        for mac_address in mac_list:
-            vendor = lookup_mac_vendor(mac_address)
-            if vendor != "Unknown" and vendor not in mac_vendors:
-                mac_vendors.append(vendor)
 
-        mac_vendor = "; ".join(sorted(mac_vendors)) if mac_vendors else "Unknown"
-        device_type = classify_device(desc, mac_vendors)
-
-        row = {
-            "Device": hostname,
-            "Management IP": mgmt_ip,
-            "Interface": iface,
-            "SVI IP Address": svi_info["ip_address"],
-            "SVI Status": svi_info["status"],
-            "Interface Status": status_info.get("status", ""),
-            "Interface Error Reason": interface_error_reasons.get(iface, ""),
-            "Admin Status": data["admin"],
-            "Operational Status": data["oper"],
-            "VLAN": vlan_id,
-            "VLAN Name": vlan_name,
-            "Mode": switchport["mode"],
-            "Native VLAN": switchport["native_vlan"],
-            "Allowed VLANs": switchport["allowed_vlans"],
-            "Circuit Vendor": find_vendor(desc),
-            "Circuit IDs": find_circuit_id(desc),
-            "Circuit Type": circuit_type(desc),
-            "Circuit Directly Attached": directly_attached(desc),
-            "Matched Keywords": find_keywords(desc),
-            "Description": desc,
-            "MAC Count": mac_count,
-            "MAC Addresses": mac_addresses,
-            "MAC Vendor": mac_vendor,
-            "Device Type": device_type,
-        }
-
-        row["Notes"] = build_notes(row)
+        row = empty_row()
+        row.update(
+            {
+                "Record Type": "Unused SVI",
+                "Interface": iface,
+                "SVI IP Address": svi_info["ip_address"],
+                "SVI Status": svi_info["status"],
+                "Interface Status": status_info.get("status", ""),
+                "Interface Error Reason": interface_error_reasons.get(
+                    iface,
+                    "",
+                ),
+                "Admin Status": interface_data["admin"],
+                "Operational Status": interface_data["oper"],
+                "VLAN": vlan_id,
+                "VLAN Name": vlan_inventory.get(
+                    vlan_id,
+                    {"name": ""},
+                )["name"],
+                "Description": interface_data["desc"],
+                "MAC Count": mac_vlan_counts.get(vlan_id, mac_info["count"]),
+                "Device Type": "SVI",
+                "Notes": (
+                    "No configured port membership and "
+                    "no learned MAC addresses"
+                ),
+            }
+        )
         rows.append(row)
 
     return rows
@@ -681,6 +826,7 @@ def main():
     fields = [
         "Device",
         "Management IP",
+        "Record Type",
         "Interface",
         "SVI IP Address",
         "SVI Status",
