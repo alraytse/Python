@@ -159,6 +159,27 @@ def check_mac_arp(mac_info, vlan, arp_entries, arp_available):
     return "PASS", ""
 
 
+def decode_mac(mac, base_oid, oui_registry):
+    """Return formatted OUI, OID, and organization details for a MAC."""
+    octets = normalize_mac(mac)
+    oui = "".join(f"{octet:02X}" for octet in octets[:3])
+    formatted_oui = f"{oui[:2]}-{oui[2:4]}-{oui[4:6]}"
+    oid = mac_to_oid(mac, base_oid)
+    first_octet = octets[0]
+
+    if first_octet & 0x01:
+        company = "Multicast address"
+    elif first_octet & 0x02:
+        company = "Locally administered/randomized MAC"
+    else:
+        company = oui_registry.get(
+            oui,
+            "Not found in IEEE OUI registry",
+        )
+
+    return formatted_oui, oid, company
+
+
 def get_mac_info(connection, vlan, base_oid, oui_registry):
     try:
         output = connection.send_command(
@@ -173,39 +194,21 @@ def get_mac_info(connection, vlan, base_oid, oui_registry):
         ]
 
         mac_addresses = []
-        mac_ouis = []
-        mac_oids = []
         mac_companies = []
 
         for entry in entries:
             mac = entry["mac"]
-            octets = normalize_mac(mac)
-            oui = "".join(f"{octet:02X}" for octet in octets[:3])
-            first_octet = octets[0]
-
-            mac_addresses.append(mac)
-            mac_ouis.append(
-                f"{oui[:2]}-{oui[2:4]}-{oui[4:6]}"
+            _, _, mac_company = decode_mac(
+                mac,
+                base_oid,
+                oui_registry,
             )
-            mac_oids.append(mac_to_oid(mac, base_oid))
-
-            if first_octet & 0x01:
-                company = "Multicast address"
-            elif first_octet & 0x02:
-                company = "Locally administered/randomized MAC"
-            else:
-                company = oui_registry.get(
-                    oui,
-                    "Not found in IEEE OUI registry",
-                )
-
-            mac_companies.append(company)
+            mac_addresses.append(mac)
+            mac_companies.append(mac_company)
 
         return {
             "MAC_Count": str(len(mac_addresses)),
             "MAC_Address": "; ".join(mac_addresses),
-            "MAC_OUI": "; ".join(mac_ouis),
-            "MAC_OID": "; ".join(mac_oids),
             "MAC_Company": "; ".join(mac_companies),
         }
 
@@ -214,8 +217,6 @@ def get_mac_info(connection, vlan, base_oid, oui_registry):
         return {
             "MAC_Count": "0",
             "MAC_Address": "",
-            "MAC_OUI": "",
-            "MAC_OID": "",
             "MAC_Company": "",
         }
 
@@ -231,10 +232,13 @@ def check_root(connection, vlan):
         return False
 
 
-def get_svi_info(connection, vlan):
+def get_svi_info(connection, vlan, base_oid, oui_registry):
     description = ""
     ip_address = ""
     svi_mac = ""
+    svi_oui = ""
+    svi_oid = ""
+    svi_company = ""
 
     try:
         output = connection.send_command(
@@ -268,12 +272,24 @@ def get_svi_info(connection, vlan):
             match = re.search(mac_pattern, line, re.IGNORECASE)
             if match:
                 svi_mac = format_mac(match.group(1))
+                svi_oui, svi_oid, svi_company = decode_mac(
+                    svi_mac,
+                    base_oid,
+                    oui_registry,
+                )
                 break
 
     except Exception:
         pass
 
-    return description, ip_address, svi_mac
+    return (
+        description,
+        ip_address,
+        svi_mac,
+        svi_oui,
+        svi_oid,
+        svi_company,
+    )
 
 
 def get_hostname(connection):
@@ -324,7 +340,12 @@ def process_switch(
                 arp_entries,
                 arp_available,
             )
-            svi_description, svi_ip, svi_mac = get_svi_info(connection, vlan_id)
+            svi_description, svi_ip, svi_mac, svi_oui, svi_oid, svi_company = get_svi_info(
+                connection,
+                vlan_id,
+                base_oid,
+                oui_registry,
+            )
             is_root = check_root(connection, vlan_id)
 
             results.append({
@@ -333,12 +354,13 @@ def process_switch(
                 "VLAN_Name": vlan_info["name"],
                 "SVI_IP": svi_ip,
                 "SVI_MAC": svi_mac,
+                "SVI_MAC_OUI": svi_oui,
+                "SVI_MAC_OID": svi_oid,
+                "SVI_MAC_Company": svi_company,
                 "SVI_Description": svi_description,
                 "MAC_Count": mac_info["MAC_Count"],
                 "ARP_Count": str(arp_count),
                 "MAC_Address": mac_info["MAC_Address"],
-                "MAC_OUI": mac_info["MAC_OUI"],
-                "MAC_OID": mac_info["MAC_OID"],
                 "MAC_Company": mac_info["MAC_Company"],
                 "ARP_Check": arp_check,
                 "ARP_Missing_MACs": arp_missing_macs,
@@ -425,12 +447,13 @@ def write_csv(results, csv_file):
         "VLAN_Name",
         "SVI_IP",
         "SVI_MAC",
+        "SVI_MAC_OUI",
+        "SVI_MAC_OID",
+        "SVI_MAC_Company",
         "SVI_Description",
         "MAC_Count",
         "ARP_Count",
         "MAC_Address",
-        "MAC_OUI",
-        "MAC_OID",
         "MAC_Company",
         "ARP_Check",
         "ARP_Missing_MACs",
@@ -467,7 +490,6 @@ def display_results(results, max_mac_count, max_arp_count):
                 f"{'MACs':<6}"
                 f"{'ARPs':<6}"
                 f"{'MAC Address':<24}"
-                f"{'OUI':<12}"
                 f"{'Company':<32}"
                 f"{'ARP Check':<16}"
                 f"{'Root':<8}"
@@ -482,13 +504,18 @@ def display_results(results, max_mac_count, max_arp_count):
             f"{row['MAC_Count']:<6}"
             f"{row['ARP_Count']:<6}"
             f"{row['MAC_Address']:<24}"
-            f"{row['MAC_OUI']:<12}"
             f"{row['MAC_Company']:<32}"
             f"{row['ARP_Check']:<16}"
             f"{row['Root_Bridge']:<8}"
         )
-        if row["MAC_OID"]:
-            print(f"{'':<8}{'MAC OID: ' + row['MAC_OID']}")
+        if row["SVI_MAC"]:
+            print(f"{'':<8}{'SVI MAC: ' + row['SVI_MAC']}")
+        if row["SVI_MAC_OUI"]:
+            print(f"{'':<8}{'SVI MAC OUI: ' + row['SVI_MAC_OUI']}")
+        if row["SVI_MAC_OID"]:
+            print(f"{'':<8}{'SVI MAC OID: ' + row['SVI_MAC_OID']}")
+        if row["SVI_MAC_Company"]:
+            print(f"{'':<8}{'SVI MAC Company: ' + row['SVI_MAC_Company']}")
         if row["ARP_Missing_MACs"]:
             print(f"{'':<8}{'MACs missing ARP: ' + row['ARP_Missing_MACs']}")
         if row["SVI_Description"]:
