@@ -232,14 +232,15 @@ def check_root(connection, vlan):
 
 
 def get_svi_info(connection, vlan):
+    description = ""
+    ip_address = ""
+    svi_mac = ""
+
     try:
         output = connection.send_command(
             f"show run interface vlan {vlan}",
             read_timeout=30,
         )
-
-        description = ""
-        ip_address = ""
 
         for line in output.splitlines():
             line = line.strip()
@@ -249,10 +250,30 @@ def get_svi_info(connection, vlan):
             elif line.startswith("ip address "):
                 ip_address = line.replace("ip address ", "", 1)
 
-        return description, ip_address
+    except Exception:
+        pass
+
+    try:
+        output = connection.send_command(
+            f"show interface vlan {vlan}",
+            read_timeout=30,
+        )
+        mac_pattern = (
+            r"\baddress is\s+"
+            r"([0-9a-fA-F]{4}(?:[.:-][0-9a-fA-F]{4}){2}|"
+            r"[0-9a-fA-F]{12})\b"
+        )
+
+        for line in output.splitlines():
+            match = re.search(mac_pattern, line, re.IGNORECASE)
+            if match:
+                svi_mac = format_mac(match.group(1))
+                break
 
     except Exception:
-        return "", ""
+        pass
+
+    return description, ip_address, svi_mac
 
 
 def get_hostname(connection):
@@ -303,7 +324,7 @@ def process_switch(
                 arp_entries,
                 arp_available,
             )
-            svi_description, svi_ip = get_svi_info(connection, vlan_id)
+            svi_description, svi_ip, svi_mac = get_svi_info(connection, vlan_id)
             is_root = check_root(connection, vlan_id)
 
             results.append({
@@ -311,6 +332,7 @@ def process_switch(
                 "VLAN": vlan_id,
                 "VLAN_Name": vlan_info["name"],
                 "SVI_IP": svi_ip,
+                "SVI_MAC": svi_mac,
                 "SVI_Description": svi_description,
                 "MAC_Count": mac_info["MAC_Count"],
                 "ARP_Count": str(arp_count),
@@ -402,6 +424,7 @@ def write_csv(results, csv_file):
         "VLAN",
         "VLAN_Name",
         "SVI_IP",
+        "SVI_MAC",
         "SVI_Description",
         "MAC_Count",
         "ARP_Count",
@@ -440,6 +463,7 @@ def display_results(results, max_mac_count, max_arp_count):
                 f"{'VLAN':<8}"
                 f"{'VLAN Name':<20}"
                 f"{'SVI IP':<20}"
+                f"{'SVI MAC':<20}"
                 f"{'MACs':<6}"
                 f"{'ARPs':<6}"
                 f"{'MAC Address':<24}"
@@ -454,6 +478,7 @@ def display_results(results, max_mac_count, max_arp_count):
             f"{row['VLAN']:<8}"
             f"{row['VLAN_Name']:<20}"
             f"{row['SVI_IP']:<20}"
+            f"{row['SVI_MAC']:<20}"
             f"{row['MAC_Count']:<6}"
             f"{row['ARP_Count']:<6}"
             f"{row['MAC_Address']:<24}"
