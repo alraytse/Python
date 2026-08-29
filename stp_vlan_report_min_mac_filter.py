@@ -19,17 +19,18 @@ DEFAULT_MAX_ARP_COUNT = 3
 
 
 def parse_vlans(output):
-    vlans = []
+    vlan_map = {}
 
     for line in output.splitlines():
         match = re.match(r"^(\d+)\s+(\S+)", line.strip())
         if match:
-            vlans.append({
-                "vlan": match.group(1),
+            vlan_id = match.group(1)
+            vlan_map[vlan_id] = {
+                "vlan": vlan_id,
                 "name": match.group(2),
-            })
+            }
 
-    return vlans
+    return list(vlan_map.values())
 
 
 def normalize_mac(mac):
