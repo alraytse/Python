@@ -467,6 +467,18 @@ def write_csv(results, csv_file):
         writer.writerows(results)
 
 
+def deduplicate_results(results):
+    """Keep only the first report row for each VLAN ID globally."""
+    unique_results = {}
+
+    for row in results:
+        vlan_id = row["VLAN"]
+        if vlan_id not in unique_results:
+            unique_results[vlan_id] = row
+
+    return list(unique_results.values())
+
+
 def display_results(results, max_mac_count, max_arp_count):
     print("\n" + "=" * 240)
     print(
@@ -627,6 +639,8 @@ def main():
                 args.max_arp_count,
             )
         )
+
+    all_results = deduplicate_results(all_results)
 
     all_results.sort(
         key=lambda row: (
