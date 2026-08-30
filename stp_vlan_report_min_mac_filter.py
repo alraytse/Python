@@ -468,14 +468,15 @@ def write_csv(results, csv_file):
 
 
 def deduplicate_results(results):
-    """Keep only the first report row for each numeric VLAN ID globally."""
+    """Keep only one report row per switch and numeric VLAN ID."""
     unique_results = {}
 
     for row in results:
         vlan_id = str(int(row["VLAN"]))
-        if vlan_id not in unique_results:
-            row["VLAN"] = vlan_id
-            unique_results[vlan_id] = row
+        row["VLAN"] = vlan_id
+        result_key = (row["Device"], vlan_id)
+        if result_key not in unique_results:
+            unique_results[result_key] = row
 
     return list(unique_results.values())
 
@@ -485,7 +486,7 @@ def display_results(results, max_mac_count, max_arp_count):
     print(
         "VLAN / SVI / MAC / ARP / OID / COMPANY / "
         "SPANNING TREE ROOT REPORT "
-        f"(MAC COUNT <= {max_mac_count}, ARP COUNT <= {max_arp_count})"
+        f"(MAC MAX {max_mac_count}, ARP MAX {max_arp_count})"
     )
     print("=" * 240)
 
@@ -494,9 +495,10 @@ def display_results(results, max_mac_count, max_arp_count):
 
     for row in results:
         vlan_id = str(int(row["VLAN"]))
-        if vlan_id in displayed_vlans:
+        display_key = (row["Device"], vlan_id)
+        if display_key in displayed_vlans:
             continue
-        displayed_vlans.add(vlan_id)
+        displayed_vlans.add(display_key)
         if row["Device"] != current_device:
             current_device = row["Device"]
             print(f"\nSwitch: {current_device}")
