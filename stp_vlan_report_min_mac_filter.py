@@ -78,7 +78,7 @@ def mac_to_oid(mac, base_oid=MAC_OID_BASE):
 
 
 def parse_mac_table(output):
-    """Return a list of {'vlan': ..., 'mac': ...} entries from NX-OS output."""
+    """Return dynamic VLAN/MAC/port entries from NX-OS output."""
     entries = []
     mac_pattern = (
         r"^\s*\*?\s*(\d+)\s+"
@@ -89,10 +89,17 @@ def parse_mac_table(output):
     for line in output.splitlines():
         match = re.match(mac_pattern, line)
         is_dynamic = re.search(r"\bdynamic\b", line, re.IGNORECASE)
+        port_match = re.search(
+            r"\b((?:Eth(?:ernet)?|Po(?:rt-channel)?|"
+            r"port-channel|sup-eth|mgmt)\S*)\s*$",
+            line,
+            re.IGNORECASE,
+        )
         if match and is_dynamic:
             entries.append({
                 "vlan": match.group(1),
                 "mac": format_mac(match.group(2)),
+                "port": port_match.group(1) if port_match else "",
             })
 
     return entries
@@ -197,6 +204,7 @@ def get_mac_info(connection, vlan, base_oid, oui_registry):
 
         mac_addresses = []
         mac_companies = []
+        mac_ports = []
 
         for entry in entries:
             mac = entry["mac"]
@@ -207,11 +215,14 @@ def get_mac_info(connection, vlan, base_oid, oui_registry):
             )
             mac_addresses.append(mac)
             mac_companies.append(mac_company)
+            if entry["port"]:
+                mac_ports.append(entry["port"])
 
         return {
             "MAC_Count": str(len(mac_addresses)),
             "MAC_Address": "; ".join(mac_addresses),
             "MAC_Company": "; ".join(mac_companies),
+            "MAC_Port": "; ".join(dict.fromkeys(mac_ports)),
         }
 
     except Exception as error:
@@ -220,7 +231,68 @@ def get_mac_info(connection, vlan, base_oid, oui_registry):
             "MAC_Count": "0",
             "MAC_Address": "",
             "MAC_Company": "",
+            "MAC_Port": "",
         }
+
+
+def parse_interface_rate(output, direction):
+    """Return the highest parsed recent input/output rate in bits per second."""
+    pattern = re.compile(
+        rf"(?:5 minute|30 seconds)\s+{direction}put rate\s+"
+        r"([0-9,]+)\s+bits/sec",
+        re.IGNORECASE,
+    )
+    rates = []
+
+    for match in pattern.finditer(output):
+        rates.append(int(match.group(1).replace(",", "")))
+
+    return max(rates, default=None)
+
+
+def check_port_traffic(connection, port_list):
+    """Check recent traffic rates on the access ports associated with dynamic MACs."""
+    ports = [
+        port.strip()
+        for port in port_list.split(";")
+        if port.strip()
+    ]
+
+    if not ports:
+        return "NO_ACCESS_PORTS", ""
+
+    checked_ports = []
+    traffic_detected = False
+    successful_checks = 0
+
+    for port in dict.fromkeys(ports):
+        try:
+            output = connection.send_command(
+                f"show interface {port}",
+                read_timeout=30,
+            )
+            input_rate = parse_interface_rate(output, "in")
+            output_rate = parse_interface_rate(output, "out")
+
+            if input_rate is None and output_rate is None:
+                continue
+
+            successful_checks += 1
+            checked_ports.append(port)
+            if (input_rate or 0) > 0 or (output_rate or 0) > 0:
+                traffic_detected = True
+
+        except Exception:
+            continue
+
+    if traffic_detected:
+        status = "TRAFFIC_DETECTED"
+    elif successful_checks:
+        status = "NO_TRAFFIC"
+    else:
+        status = "TRAFFIC_UNAVAILABLE"
+
+    return status, "; ".join(checked_ports)
 
 
 def check_root(connection, vlan):
@@ -338,6 +410,17 @@ def process_switch(
             elif mac_count > max_mac_count:
                 continue
 
+            traffic_check = "NOT_CHECKED"
+            traffic_ports = ""
+            if (
+                1 <= mac_count <= 2
+                or 1 <= arp_count <= 2
+            ):
+                traffic_check, traffic_ports = check_port_traffic(
+                    connection,
+                    mac_info["MAC_Port"],
+                )
+
             arp_check, arp_missing_macs = check_mac_arp(
                 mac_info,
                 vlan_id,
@@ -367,6 +450,8 @@ def process_switch(
                 "SVI_Description": svi_description,
                 "MAC_Count": mac_info["MAC_Count"],
                 "ARP_Count": str(arp_count),
+                "Traffic_Check": traffic_check,
+                "Traffic_Ports": traffic_ports,
                 "MAC_Address": mac_info["MAC_Address"],
                 "MAC_Company": mac_info["MAC_Company"],
                 "ARP_Check": arp_check,
@@ -459,6 +544,8 @@ def write_csv(results, csv_file):
         "SVI_Description",
         "MAC_Count",
         "ARP_Count",
+        "Traffic_Check",
+        "Traffic_Ports",
         "MAC_Address",
         "MAC_Company",
         "ARP_Check",
@@ -516,6 +603,7 @@ def display_results(results, max_mac_count, max_arp_count):
                 f"{'SVI MAC':<20}"
                 f"{'MACs':<6}"
                 f"{'ARPs':<6}"
+                f"{'Traffic':<18}"
                 f"{'MAC Address':<24}"
                 f"{'Company':<32}"
                 f"{'ARP Check':<16}"
@@ -531,6 +619,7 @@ def display_results(results, max_mac_count, max_arp_count):
             f"{row['SVI_MAC']:<20}"
             f"{row['MAC_Count']:<6}"
             f"{row['ARP_Count']:<6}"
+            f"{row['Traffic_Check']:<18}"
             f"{row['MAC_Address']:<24}"
             f"{row['MAC_Company']:<32}"
             f"{row['ARP_Check']:<16}"
@@ -541,6 +630,8 @@ def display_results(results, max_mac_count, max_arp_count):
             print(f"{'':<8}{'SVI MAC: ' + row['SVI_MAC']}")
         if row["SVI_MAC_Company"]:
             print(f"{'':<8}{'SVI MAC Company: ' + row['SVI_MAC_Company']}")
+        if row["Traffic_Ports"]:
+            print(f"{'':<8}{'Traffic ports checked: ' + row['Traffic_Ports']}")
         if row["ARP_Missing_MACs"]:
             print(f"{'':<8}{'MACs missing ARP: ' + row['ARP_Missing_MACs']}")
         if row["SVI_Description"]:
