@@ -88,7 +88,8 @@ def parse_mac_table(output):
 
     for line in output.splitlines():
         match = re.match(mac_pattern, line)
-        if match:
+        is_dynamic = re.search(r"\bdynamic\b", line, re.IGNORECASE)
+        if match and is_dynamic:
             entries.append({
                 "vlan": match.group(1),
                 "mac": format_mac(match.group(2)),
@@ -350,6 +351,11 @@ def process_switch(
                 oui_registry,
             )
             is_root = check_root(connection, vlan_id)
+            shutdown_recommendation = (
+                "VLAN"
+                if mac_count == 0 and arp_count == 0
+                else ""
+            )
 
             results.append({
                 "Device": hostname,
@@ -366,6 +372,7 @@ def process_switch(
                 "ARP_Check": arp_check,
                 "ARP_Missing_MACs": arp_missing_macs,
                 "Root_Bridge": "YES" if is_root else "NO",
+                "Shutdown_Recommendation": shutdown_recommendation,
             })
 
     except Exception as error:
@@ -457,6 +464,7 @@ def write_csv(results, csv_file):
         "ARP_Check",
         "ARP_Missing_MACs",
         "Root_Bridge",
+        "Shutdown_Recommendation",
     ]
 
     with open(csv_file, "w", newline="", encoding="utf-8") as csvfile:
@@ -512,6 +520,7 @@ def display_results(results, max_mac_count, max_arp_count):
                 f"{'Company':<32}"
                 f"{'ARP Check':<16}"
                 f"{'Root':<8}"
+                f"{'Shutdown':<10}"
             )
             print("-" * 240)
 
@@ -526,6 +535,7 @@ def display_results(results, max_mac_count, max_arp_count):
             f"{row['MAC_Company']:<32}"
             f"{row['ARP_Check']:<16}"
             f"{row['Root_Bridge']:<8}"
+            f"{row['Shutdown_Recommendation']:<10}"
         )
         if row["SVI_MAC"]:
             print(f"{'':<8}{'SVI MAC: ' + row['SVI_MAC']}")
