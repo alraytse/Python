@@ -14,8 +14,8 @@ from netmiko import ConnectHandler
 CSV_FILE = "stp_vlan_report.csv"
 MAC_OID_BASE = "1.3.6.1.2.1.17.4.3.1.1"
 IEEE_OUI_URL = "https://standards-oui.ieee.org/oui/oui.csv"
-DEFAULT_MAX_MAC_COUNT = 2
-DEFAULT_MAX_ARP_COUNT = 2
+DEFAULT_MAX_MAC_COUNT = 3
+DEFAULT_MAX_ARP_COUNT = 3
 
 
 def parse_vlans(output):
@@ -237,7 +237,6 @@ def get_svi_info(connection, vlan, base_oid, oui_registry):
     description = ""
     ip_address = ""
     svi_mac = ""
-    svi_oid = ""
     svi_company = ""
 
     try:
@@ -272,7 +271,7 @@ def get_svi_info(connection, vlan, base_oid, oui_registry):
             match = re.search(mac_pattern, line, re.IGNORECASE)
             if match:
                 svi_mac = format_mac(match.group(1))
-                _, svi_oid, svi_company = decode_mac(
+                _, _, svi_company = decode_mac(
                     svi_mac,
                     base_oid,
                     oui_registry,
@@ -286,7 +285,6 @@ def get_svi_info(connection, vlan, base_oid, oui_registry):
         description,
         ip_address,
         svi_mac,
-        svi_oid,
         svi_company,
     )
 
@@ -330,12 +328,13 @@ def process_switch(
             mac_count = int(mac_info["MAC_Count"])
             arp_count = get_arp_count(arp_entries, vlan_id)
 
-            if (
-                not arp_available
-                or mac_count > max_mac_count
-                or arp_count > max_arp_count
-                or mac_count != arp_count
-            ):
+            if arp_available:
+                if (
+                    mac_count > max_mac_count
+                    and arp_count > max_arp_count
+                ):
+                    continue
+            elif mac_count > max_mac_count:
                 continue
 
             arp_check, arp_missing_macs = check_mac_arp(
@@ -344,7 +343,7 @@ def process_switch(
                 arp_entries,
                 arp_available,
             )
-            svi_description, svi_ip, svi_mac, svi_oid, svi_company = get_svi_info(
+            svi_description, svi_ip, svi_mac, svi_company = get_svi_info(
                 connection,
                 vlan_id,
                 base_oid,
@@ -358,7 +357,6 @@ def process_switch(
                 "VLAN_Name": vlan_info["name"],
                 "SVI_IP": svi_ip,
                 "SVI_MAC": svi_mac,
-                "SVI_MAC_OID": svi_oid,
                 "SVI_MAC_Company": svi_company,
                 "SVI_Description": svi_description,
                 "MAC_Count": mac_info["MAC_Count"],
@@ -450,7 +448,6 @@ def write_csv(results, csv_file):
         "VLAN_Name",
         "SVI_IP",
         "SVI_MAC",
-        "SVI_MAC_OID",
         "SVI_MAC_Company",
         "SVI_Description",
         "MAC_Count",
@@ -532,8 +529,6 @@ def display_results(results, max_mac_count, max_arp_count):
         )
         if row["SVI_MAC"]:
             print(f"{'':<8}{'SVI MAC: ' + row['SVI_MAC']}")
-        if row["SVI_MAC_OID"]:
-            print(f"{'':<8}{'SVI MAC OID: ' + row['SVI_MAC_OID']}")
         if row["SVI_MAC_Company"]:
             print(f"{'':<8}{'SVI MAC Company: ' + row['SVI_MAC_Company']}")
         if row["ARP_Missing_MACs"]:
