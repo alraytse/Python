@@ -330,7 +330,12 @@ def process_switch(
             mac_count = int(mac_info["MAC_Count"])
             arp_count = get_arp_count(arp_entries, vlan_id)
 
-            if mac_count > max_mac_count or arp_count > max_arp_count:
+            if (
+                not arp_available
+                or mac_count > max_mac_count
+                or arp_count > max_arp_count
+                or mac_count != arp_count
+            ):
                 continue
 
             arp_check, arp_missing_macs = check_mac_arp(
