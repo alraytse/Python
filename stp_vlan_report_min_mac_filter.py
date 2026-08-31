@@ -237,7 +237,6 @@ def get_svi_info(connection, vlan, base_oid, oui_registry):
     description = ""
     ip_address = ""
     svi_mac = ""
-    svi_oui = ""
     svi_oid = ""
     svi_company = ""
 
@@ -273,7 +272,7 @@ def get_svi_info(connection, vlan, base_oid, oui_registry):
             match = re.search(mac_pattern, line, re.IGNORECASE)
             if match:
                 svi_mac = format_mac(match.group(1))
-                svi_oui, svi_oid, svi_company = decode_mac(
+                _, svi_oid, svi_company = decode_mac(
                     svi_mac,
                     base_oid,
                     oui_registry,
@@ -287,7 +286,6 @@ def get_svi_info(connection, vlan, base_oid, oui_registry):
         description,
         ip_address,
         svi_mac,
-        svi_oui,
         svi_oid,
         svi_company,
     )
@@ -341,7 +339,7 @@ def process_switch(
                 arp_entries,
                 arp_available,
             )
-            svi_description, svi_ip, svi_mac, svi_oui, svi_oid, svi_company = get_svi_info(
+            svi_description, svi_ip, svi_mac, svi_oid, svi_company = get_svi_info(
                 connection,
                 vlan_id,
                 base_oid,
@@ -355,7 +353,6 @@ def process_switch(
                 "VLAN_Name": vlan_info["name"],
                 "SVI_IP": svi_ip,
                 "SVI_MAC": svi_mac,
-                "SVI_MAC_OUI": svi_oui,
                 "SVI_MAC_OID": svi_oid,
                 "SVI_MAC_Company": svi_company,
                 "SVI_Description": svi_description,
@@ -448,7 +445,6 @@ def write_csv(results, csv_file):
         "VLAN_Name",
         "SVI_IP",
         "SVI_MAC",
-        "SVI_MAC_OUI",
         "SVI_MAC_OID",
         "SVI_MAC_Company",
         "SVI_Description",
@@ -531,8 +527,6 @@ def display_results(results, max_mac_count, max_arp_count):
         )
         if row["SVI_MAC"]:
             print(f"{'':<8}{'SVI MAC: ' + row['SVI_MAC']}")
-        if row["SVI_MAC_OUI"]:
-            print(f"{'':<8}{'SVI MAC OUI: ' + row['SVI_MAC_OUI']}")
         if row["SVI_MAC_OID"]:
             print(f"{'':<8}{'SVI MAC OID: ' + row['SVI_MAC_OID']}")
         if row["SVI_MAC_Company"]:
