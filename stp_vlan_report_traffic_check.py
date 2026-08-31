@@ -105,6 +105,17 @@ def parse_mac_table(output):
     return entries
 
 
+def is_port_channel(port):
+    """Return True when an interface name identifies a port-channel."""
+    return bool(
+        re.match(
+            r"^(?:po|port-channel)\S*$",
+            port.strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
 def parse_arp_table(output):
     """Return distinct ARP MAC addresses grouped by VLAN."""
     mac_pattern = (
@@ -190,6 +201,7 @@ def decode_mac(mac, base_oid, oui_registry):
 
 
 def get_mac_info(connection, vlan, base_oid, oui_registry):
+    """Return dynamic MAC data while excluding port-channel entries."""
     try:
         output = connection.send_command(
             "show mac address-table",
@@ -199,7 +211,10 @@ def get_mac_info(connection, vlan, base_oid, oui_registry):
         entries = [
             entry
             for entry in parse_mac_table(output)
-            if entry["vlan"] == str(vlan)
+            if (
+                entry["vlan"] == str(vlan)
+                and not is_port_channel(entry["port"])
+            )
         ]
 
         mac_addresses = []
