@@ -14,8 +14,8 @@ from netmiko import ConnectHandler
 CSV_FILE = "stp_vlan_report.csv"
 MAC_OID_BASE = "1.3.6.1.2.1.17.4.3.1.1"
 IEEE_OUI_URL = "https://standards-oui.ieee.org/oui/oui.csv"
-DEFAULT_MAX_MAC_COUNT = 3
-DEFAULT_MAX_ARP_COUNT = 3
+DEFAULT_MAX_MAC_COUNT = 2
+DEFAULT_MAX_ARP_COUNT = 2
 
 
 def parse_vlans(output):
