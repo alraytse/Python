@@ -413,7 +413,7 @@ def process_switch(
             if arp_available:
                 if (
                     mac_count > max_mac_count
-                    and arp_count > max_arp_count
+                    or arp_count > max_arp_count
                 ):
                     continue
             elif mac_count > max_mac_count:
@@ -446,9 +446,9 @@ def process_switch(
             )
             is_root = check_root(connection, vlan_id)
             shutdown_recommendation = (
-                "VLAN"
+                "YES"
                 if mac_count == 0 and arp_count == 0
-                else ""
+                else "NO"
             )
 
             results.append({
@@ -722,6 +722,14 @@ def main():
 
     if args.max_arp_count < 0:
         print("Error: --max-arp-count cannot be negative.")
+        return 2
+
+    if args.max_mac_count > 2:
+        print("Error: --max-mac-count cannot exceed 2.")
+        return 2
+
+    if args.max_arp_count > 2:
+        print("Error: --max-arp-count cannot exceed 2.")
         return 2
 
     hosts = input(
