@@ -5,7 +5,7 @@ import csv
 import getpass
 import json
 import sys
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
 import requests
 import urllib3
@@ -17,6 +17,8 @@ DEVICES_PATH = "/ServicesAPI/API/V1/CMDB/Devices"
 DEFAULT_INTERFACES_PATH = (
     "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/Interfaces"
 )
+DEFAULT_PAGE_SIZE = 50
+DEFAULT_MAX_PAGES = 100
 
 
 class NetBrainClient:
@@ -33,7 +35,7 @@ class NetBrainClient:
         )
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
-        url = path if path.startswith("http") else self.base_url + path
+        url = path if path.startswith(("http://", "https://")) else self.base_url + path
         response = self.session.request(
             method=method,
             url=url,
@@ -109,10 +111,140 @@ class NetBrainClient:
         )
         print("Successfully authenticated")
 
-    def get_devices(self) -> List[Dict[str, Any]]:
+    def get_devices(
+        self,
+        page_size: int = DEFAULT_PAGE_SIZE,
+        max_pages: int = DEFAULT_MAX_PAGES,
+        page_param: str = "pageNo",
+        page_size_param: str = "pageSize",
+    ) -> List[Dict[str, Any]]:
+        """Retrieve devices, following API pagination when available.
+
+        The first request intentionally has no query parameters so it remains
+        compatible with the working API call. If NetBrain returns pagination
+        metadata, the next URL/token is followed. If metadata is absent and
+        the page is full, a pageNo/pageSize request is attempted and duplicate
+        records are detected to prevent an infinite loop.
+        """
+        all_devices: List[Dict[str, Any]] = []
+        seen_devices: Set[Tuple[str, str, str]] = set()
         response = self.request("GET", DEVICES_PATH)
-        devices = extract_records(response, ("devices", "data", "items", "results"))
-        return [item for item in devices if isinstance(item, dict)]
+        page_number = 1
+
+        for _ in range(max_pages):
+            records = extract_records(
+                response,
+                ("devices", "data", "items", "results"),
+            )
+            page_devices = [
+                item for item in records if isinstance(item, dict)
+            ]
+
+            new_count = 0
+            for device in page_devices:
+                key = device_key(device)
+                if key not in seen_devices:
+                    seen_devices.add(key)
+                    all_devices.append(device)
+                    new_count += 1
+
+            print(
+                f"Retrieved device page {page_number}: "
+                f"{len(page_devices)} records ({new_count} new)"
+            )
+
+            # Some deployments ignore unknown page parameters and return the
+            # first page repeatedly. Stop as soon as a later page adds no new
+            # unique devices.
+            if page_number > 1 and new_count == 0:
+                print(
+                    "Pagination returned no new unique devices; "
+                    "stopping safely."
+                )
+                break
+
+            next_url = find_first_key(
+                response,
+                {
+                    "next",
+                    "nexturl",
+                    "nextpageurl",
+                    "nextpageurl",
+                    "nextlink",
+                },
+            )
+            next_token = find_first_key(
+                response,
+                {
+                    "nexttoken",
+                    "nextpagetoken",
+                    "continuationtoken",
+                    "continuation_token",
+                    "cursor",
+                },
+            )
+            has_more = find_boolean_key(
+                response,
+                {"hasmore", "has_more", "ismore", "moreavailable"},
+            )
+
+            total = find_number_key(
+                response,
+                {"total", "totalcount", "total_count", "recordcount"},
+            )
+            if (
+                has_more is None
+                and total is not None
+                and len(all_devices) < total
+            ):
+                has_more = True
+
+            if next_url:
+                response = self.request("GET", str(next_url))
+                page_number += 1
+                continue
+
+            if next_token:
+                response = self.request(
+                    "GET",
+                    DEVICES_PATH,
+                    params={"pageToken": str(next_token)},
+                )
+                page_number += 1
+                continue
+
+            should_request_next_page = (
+                has_more is True
+                or (has_more is None and len(page_devices) >= page_size)
+            )
+            if not should_request_next_page:
+                break
+
+            page_number += 1
+            try:
+                response = self.request(
+                    "GET",
+                    DEVICES_PATH,
+                    params={
+                        page_param: page_number,
+                        page_size_param: page_size,
+                    },
+                )
+            except Exception as error:
+                print(
+                    f"Pagination request failed on page {page_number}: {error}"
+                )
+                break
+
+            # If the server ignored the pagination parameters, the next page
+            # will contain no new devices and the loop will stop safely.
+            if page_number > 1 and not page_devices:
+                break
+
+        else:
+            print(f"Stopped after --devices-max-pages {max_pages}")
+
+        return all_devices
 
     def get_interfaces(
         self,
@@ -186,49 +318,92 @@ def extract_records(response: Any, preferred_keys: Iterable[str]) -> List[Any]:
     return []
 
 
+def find_first_key(obj: Any, wanted_keys: Set[str]) -> Optional[Any]:
+    """Find the first value for one of the keys at any response nesting level."""
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            normalized = re_key(key)
+            if normalized in wanted_keys and value not in (None, "", False):
+                if isinstance(value, (str, int, float)):
+                    return value
+            found = find_first_key(value, wanted_keys)
+            if found not in (None, ""):
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = find_first_key(value, wanted_keys)
+            if found not in (None, ""):
+                return found
+    return None
+
+
+def find_boolean_key(obj: Any, wanted_keys: Set[str]) -> Optional[bool]:
+    if isinstance(obj, dict):
+        for key, value in obj.items():
+            if re_key(key) in wanted_keys and isinstance(value, bool):
+                return value
+            found = find_boolean_key(value, wanted_keys)
+            if found is not None:
+                return found
+    elif isinstance(obj, list):
+        for value in obj:
+            found = find_boolean_key(value, wanted_keys)
+            if found is not None:
+                return found
+    return None
+
+
+def find_number_key(obj: Any, wanted_keys: Set[str]) -> Optional[int]:
+    value = find_first_key(obj, wanted_keys)
+    if isinstance(value, bool):
+        return None
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def re_key(value: Any) -> str:
+    return "".join(character.lower() for character in str(value) if character.isalnum())
+
+
+def flatten_strings(value: Any) -> Iterable[str]:
+    if isinstance(value, dict):
+        for nested_value in value.values():
+            yield from flatten_strings(nested_value)
+    elif isinstance(value, list):
+        for nested_value in value:
+            yield from flatten_strings(nested_value)
+    elif value not in (None, ""):
+        yield str(value)
+
+
 def text_from(device: Dict[str, Any], names: Iterable[str]) -> str:
     values = []
-    for name in names:
-        value = device.get(name)
-        if value not in (None, ""):
-            values.append(str(value))
+    wanted = {re_key(name) for name in names}
+
+    def collect(obj: Any) -> None:
+        if isinstance(obj, dict):
+            for key, value in obj.items():
+                if re_key(key) in wanted:
+                    values.extend(flatten_strings(value))
+                collect(value)
+        elif isinstance(obj, list):
+            for value in obj:
+                collect(value)
+
+    collect(device)
     return " ".join(values)
 
 
 def is_ddc1_device(device: Dict[str, Any]) -> bool:
-    values = text_from(
-        device,
-        (
-            "name",
-            "hostName",
-            "hostname",
-            "siteName",
-            "site",
-            "sitePath",
-            "mgmtIP",
-            "managementIp",
-            "managementIP",
-        ),
-    )
-    return "DDC1" in values.upper()
+    # Search every nested value because the site may be under a nested
+    # location/site object rather than a top-level siteName field.
+    return "DDC1" in " ".join(flatten_strings(device)).upper()
 
 
 def is_switch(device: Dict[str, Any]) -> bool:
-    values = text_from(
-        device,
-        (
-            "subTypeName",
-            "deviceType",
-            "type",
-            "deviceClass",
-            "category",
-            "vendor",
-            "model",
-            "platform",
-            "name",
-        ),
-    ).lower()
-
+    values = " ".join(flatten_strings(device)).lower()
     switch_terms = (
         "switch",
         "catalyst",
@@ -237,15 +412,46 @@ def is_switch(device: Dict[str, Any]) -> bool:
         "n3k",
         "n5k",
         "n7k",
-        "nexus",
         "arista",
         "eos",
+        "nx-os",
+        "nxos",
+        "ios-xe",
+        "leaf",
+        "spine",
     )
-    router_terms = ("router", "firewall", "load balancer", "wireless controller")
+    router_terms = (
+        "router",
+        "firewall",
+        "load balancer",
+        "wireless controller",
+    )
 
     if any(term in values for term in router_terms) and "switch" not in values:
         return False
     return any(term in values for term in switch_terms)
+
+
+def device_key(device: Dict[str, Any]) -> Tuple[str, str, str]:
+    device_id = first_value(
+        device,
+        ("id", "deviceId", "deviceID", "device_id", "uuid"),
+        "",
+    )
+    name = first_value(device, ("name", "deviceName", "hostName", "hostname"), "")
+    ip = first_value(
+        device,
+        (
+            "mgmtIP",
+            "managementIp",
+            "managementIP",
+            "management_ip",
+            "ip",
+            "ipAddress",
+        ),
+        "",
+    )
+    return str(device_id), str(name).lower(), str(ip).lower()
 
 
 def management_ip(device: Dict[str, Any]) -> str:
@@ -368,6 +574,64 @@ def display_rows(rows: List[Dict[str, str]]) -> None:
         )
 
 
+def display_device_diagnostics(all_devices: List[Dict[str, Any]]) -> None:
+    """Print enough schema information to identify NetBrain field names."""
+    print("\nDEVICE FILTER DIAGNOSTIC")
+    print("No DDC1 devices matched the returned records.")
+    print(f"Records inspected: {len(all_devices)}")
+
+    if not all_devices:
+        print("No device schema was returned by the API.")
+        return
+
+    sample = all_devices[0]
+    print("\nFirst device JSON sample:")
+    print(json.dumps(sample, indent=2, default=str)[:10000])
+
+    top_level_fields = sorted(str(key) for key in sample.keys())
+    print("\nFirst device top-level fields:")
+    print(", ".join(top_level_fields))
+
+    print("\nFirst device nested field paths:")
+    paths: List[str] = []
+
+    def collect_paths(value: Any, prefix: str = "") -> None:
+        if isinstance(value, dict):
+            for key, nested_value in value.items():
+                path = f"{prefix}.{key}" if prefix else str(key)
+                paths.append(path)
+                collect_paths(nested_value, path)
+        elif isinstance(value, list) and value:
+            collect_paths(value[0], f"{prefix}[]")
+
+    collect_paths(sample)
+    print(", ".join(paths[:300]))
+
+    print("\nReturned device names/sites/types:")
+    for device in all_devices[:20]:
+        name = first_value(
+            device,
+            ("name", "deviceName", "hostName", "hostname"),
+            "",
+        )
+        site = text_from(
+            device,
+            ("siteName", "site", "sitePath", "location", "locationName"),
+        )
+        device_type = text_from(
+            device,
+            (
+                "subTypeName",
+                "deviceType",
+                "type",
+                "deviceClass",
+                "category",
+                "platform",
+            ),
+        )
+        print(f"  name={name!r}, site={site!r}, type={device_type!r}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
@@ -409,6 +673,28 @@ def build_parser() -> argparse.ArgumentParser:
         help="HTTP method for the interface endpoint. Default: GET.",
     )
     parser.add_argument(
+        "--devices-page-param",
+        default="pageNo",
+        help="Page-number query parameter used when metadata is absent.",
+    )
+    parser.add_argument(
+        "--devices-page-size-param",
+        default="pageSize",
+        help="Page-size query parameter used when metadata is absent.",
+    )
+    parser.add_argument(
+        "--devices-page-size",
+        type=int,
+        default=DEFAULT_PAGE_SIZE,
+        help=f"Expected page size for pagination. Default: {DEFAULT_PAGE_SIZE}.",
+    )
+    parser.add_argument(
+        "--devices-max-pages",
+        type=int,
+        default=DEFAULT_MAX_PAGES,
+        help=f"Maximum device pages to retrieve. Default: {DEFAULT_MAX_PAGES}.",
+    )
+    parser.add_argument(
         "--csv-file",
         default="ddc1_switch_interfaces.csv",
         help="CSV output filename.",
@@ -418,9 +704,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
+    if args.devices_page_size <= 0 or args.devices_max_pages <= 0:
+        print(
+            "Error: --devices-page-size and --devices-max-pages must be positive.",
+            file=sys.stderr,
+        )
+        return 2
+
     username = input("Username: ").strip()
     password = getpass.getpass("Password: ")
-
     client = NetBrainClient(args.base_url, insecure=args.insecure)
 
     try:
@@ -433,15 +725,33 @@ def main() -> int:
         )
 
         print("\nRetrieving devices...")
-        all_devices = client.get_devices()
-        ddc1_switches = [
-            device
-            for device in all_devices
-            if is_ddc1_device(device) and is_switch(device)
-        ]
+        all_devices = client.get_devices(
+            page_size=args.devices_page_size,
+            max_pages=args.devices_max_pages,
+            page_param=args.devices_page_param,
+            page_size_param=args.devices_page_size_param,
+        )
 
-        print(f"Total devices returned: {len(all_devices)}")
+        ddc1_devices = [device for device in all_devices if is_ddc1_device(device)]
+        ddc1_switches = [device for device in ddc1_devices if is_switch(device)]
+
+        print(f"\nTotal unique devices returned: {len(all_devices)}")
+        print(f"DDC1 devices found: {len(ddc1_devices)}")
         print(f"DDC1 switches found: {len(ddc1_switches)}")
+
+        if not ddc1_devices:
+            display_device_diagnostics(all_devices)
+        elif not ddc1_switches:
+            print("\nDDC1 devices were found, but none matched the switch filter.")
+            print("DDC1 device types and names:")
+            for device in ddc1_devices:
+                name = first_value(
+                    device,
+                    ("name", "deviceName", "hostName", "hostname"),
+                    "",
+                )
+                device_type = " ".join(flatten_strings(device)).strip()
+                print(f"  {name}: {device_type[:300]}")
 
         rows: List[Dict[str, str]] = []
         for device in ddc1_switches:
