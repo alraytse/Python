@@ -19,6 +19,7 @@ DEFAULT_INTERFACES_PATH = (
 )
 DEFAULT_PAGE_SIZE = 50
 DEFAULT_MAX_PAGES = 100
+DEFAULT_DOMAIN_NAME = "DDC1"
 
 
 class NetBrainClient:
@@ -528,6 +529,40 @@ def normalize_interface_row(
     }
 
 
+def write_device_csv(devices: List[Dict[str, Any]], filename: str) -> None:
+    fields = [
+        "Name",
+        "ManagementIP",
+        "DeviceType",
+        "DeviceID",
+        "Site",
+    ]
+    with open(filename, "w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fields)
+        writer.writeheader()
+        for device in devices:
+            writer.writerow({
+                "Name": str(first_value(device, ("name", "deviceName", "hostName", "hostname"), "")),
+                "ManagementIP": management_ip(device),
+                "DeviceType": text_from(device, ("subTypeName", "deviceType", "type", "platform")),
+                "DeviceID": str(first_value(device, ("id", "deviceId", "deviceID", "uuid"), "")),
+                "Site": text_from(device, ("siteName", "site", "sitePath", "location", "locationName")),
+            })
+
+
+def display_devices(devices: List[Dict[str, Any]]) -> None:
+    print("\n" + "=" * 120)
+    print("DDC1 DEVICES")
+    print("=" * 120)
+    print(f"{'Device':<42}{'ManagementIP':<18}{'DeviceType':<30}{'Site':<30}")
+    print("-" * 120)
+    for device in devices:
+        name = str(first_value(device, ("name", "deviceName", "hostName", "hostname"), ""))
+        device_type = text_from(device, ("subTypeName", "deviceType", "type", "platform"))
+        site = text_from(device, ("siteName", "site", "sitePath", "location", "locationName"))
+        print(f"{name[:41]:<42}{management_ip(device)[:17]:<18}{device_type[:29]:<30}{site[:29]:<30}")
+
+
 def write_csv(rows: List[Dict[str, str]], filename: str) -> None:
     fields = [
         "Device",
@@ -655,8 +690,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--domain-name",
-        default="",
-        help="Optional NetBrain domain name sent during login.",
+        default=DEFAULT_DOMAIN_NAME,
+        help=(
+            "NetBrain domain sent during login. Default: "
+            f"{DEFAULT_DOMAIN_NAME}. Use --domain-name \"\" to omit it."
+        ),
     )
     parser.add_argument(
         "--interfaces-path-template",
@@ -697,7 +735,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--csv-file",
         default="ddc1_switch_interfaces.csv",
-        help="CSV output filename.",
+        help="CSV output filename for interface results.",
     )
     return parser
 
@@ -739,6 +777,12 @@ def main() -> int:
         print(f"DDC1 devices found: {len(ddc1_devices)}")
         print(f"DDC1 switches found: {len(ddc1_switches)}")
 
+        if ddc1_devices:
+            display_devices(ddc1_devices)
+            device_csv = args.csv_file.rsplit(".", 1)[0] + "_devices.csv"
+            write_device_csv(ddc1_devices, device_csv)
+            print(f"Device inventory CSV saved to: {device_csv}")
+
         if not ddc1_devices:
             display_device_diagnostics(all_devices)
         elif not ddc1_switches:
@@ -754,7 +798,7 @@ def main() -> int:
                 print(f"  {name}: {device_type[:300]}")
 
         rows: List[Dict[str, str]] = []
-        for device in ddc1_switches:
+        for device in ddc1_devices:
             name = first_value(device, ("name", "hostName", "hostname"), "")
             try:
                 interfaces = client.get_interfaces(
