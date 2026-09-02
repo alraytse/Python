@@ -2,6 +2,7 @@
 
 import argparse
 import csv
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import getpass
 import io
 import re
@@ -16,6 +17,12 @@ MAC_OID_BASE = "1.3.6.1.2.1.17.4.3.1.1"
 IEEE_OUI_URL = "https://standards-oui.ieee.org/oui/oui.csv"
 DEFAULT_MAX_MAC_COUNT = 2
 DEFAULT_MAX_ARP_COUNT = 2
+DEFAULT_WORKERS = 5
+TRAFFIC_NOT_CONFIRMED = {
+    "TRAFFIC_UNAVAILABLE",
+    "NOT_CHECKED",
+    "NO_ACCESS_PORTS",
+}
 
 
 def parse_vlans(output):
@@ -319,6 +326,9 @@ def get_shutdown_recommendation(
       MODERATE - no MACs and no ARPs, but traffic could not be confirmed.
       WEAK     - only one data source reports no endpoints.
       NONE     - insufficient evidence or the switch is the STP root.
+
+    Conservative policy: TRAFFIC_UNAVAILABLE, NOT_CHECKED, and
+    NO_ACCESS_PORTS cannot produce a STRONG recommendation.
     """
     if is_root:
         return (
@@ -333,9 +343,15 @@ def get_shutdown_recommendation(
                 "No dynamic MACs, no ARP entries, and no recent traffic",
             )
 
+        if traffic_check in TRAFFIC_NOT_CONFIRMED:
+            return (
+                "MODERATE",
+                "No dynamic MACs or ARP entries; traffic could not be confirmed",
+            )
+
         return (
             "MODERATE",
-            "No dynamic MACs or ARP entries; recent traffic was not confirmed",
+            "No dynamic MACs or ARP entries; traffic evidence was inconclusive",
         )
 
     if mac_count == 0 or arp_count == 0:
@@ -758,6 +774,15 @@ def build_parser():
         action="store_true",
         help="Skip IEEE registry download and report company as unavailable.",
     )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=DEFAULT_WORKERS,
+        help=(
+            "Number of switches to process concurrently. "
+            f"Default: {DEFAULT_WORKERS}"
+        ),
+    )
     return parser
 
 
@@ -770,6 +795,10 @@ def main():
 
     if args.max_arp_count < 0:
         print("Error: --max-arp-count cannot be negative.")
+        return 2
+
+    if args.workers < 1:
+        print("Error: --workers must be at least 1.")
         return 2
 
     hosts = input(
@@ -788,25 +817,44 @@ def main():
         print("Company lookup will report unavailable assignments.")
         oui_registry = {}
 
-    all_results = []
-
-    for host in host_list:
-        device = {
+    devices = [
+        {
             "device_type": "cisco_nxos",
             "host": host,
             "username": username,
             "password": password,
             "fast_cli": False,
         }
-        all_results.extend(
-            process_switch(
-                device,
-                args.mac_oid_base,
-                oui_registry,
-                args.max_mac_count,
-                args.max_arp_count,
-            )
+        for host in host_list
+    ]
+
+    all_results = []
+    if devices:
+        worker_count = min(args.workers, len(devices))
+        print(
+            f"Processing {len(devices)} switch(es) with "
+            f"{worker_count} concurrent worker(s)..."
         )
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(
+                    process_switch,
+                    device,
+                    args.mac_oid_base,
+                    oui_registry,
+                    args.max_mac_count,
+                    args.max_arp_count,
+                ): device["host"]
+                for device in devices
+            }
+
+            for future in as_completed(futures):
+                host = futures[future]
+                try:
+                    all_results.extend(future.result())
+                except Exception as error:
+                    print(f"Worker failed for {host}: {error}")
 
     all_results = deduplicate_results(all_results)
 
