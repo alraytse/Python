@@ -459,20 +459,24 @@ def process_switch(
             mac_count = int(mac_info["MAC_Count"])
             arp_count = get_arp_count(arp_entries, vlan_id)
 
-            if arp_available:
-                if (
-                    mac_count > max_mac_count
-                    and arp_count > max_arp_count
-                ):
-                    continue
-            elif mac_count > max_mac_count:
+            if not arp_available:
+                print(
+                    f"Skipping VLAN {vlan_id} on {hostname}: "
+                    "ARP count unavailable; maximum MAC/ARP filter cannot be verified"
+                )
+                continue
+
+            if (
+                mac_count > max_mac_count
+                or arp_count > max_arp_count
+            ):
                 continue
 
             traffic_check = "NOT_CHECKED"
             traffic_ports = ""
             if (
-                1 <= mac_count <= 2
-                or 1 <= arp_count <= 2
+                1 <= mac_count <= max_mac_count
+                or 1 <= arp_count <= max_arp_count
             ):
                 traffic_check, traffic_ports = check_port_traffic(
                     connection,
@@ -734,7 +738,7 @@ def build_parser():
     parser = argparse.ArgumentParser(
         description=(
             "Collect VLAN, SVI, MAC OID, OUI, company, and STP root data "
-            "for VLANs meeting maximum MAC and ARP count filters."
+            "for VLANs at or below both the maximum MAC and ARP counts."
         )
     )
     parser.add_argument(
