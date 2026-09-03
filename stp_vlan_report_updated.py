@@ -302,6 +302,28 @@ def check_port_traffic(connection, port_list):
     return status, "; ".join(checked_ports)
 
 
+def check_svi_traffic(connection, vlan):
+    """Check recent traffic rates on the VLAN SVI itself."""
+    try:
+        output = connection.send_command(
+            f"show interface vlan {vlan}",
+            read_timeout=30,
+        )
+        input_rate = parse_interface_rate(output, "in")
+        output_rate = parse_interface_rate(output, "out")
+
+        if input_rate is None and output_rate is None:
+            return "TRAFFIC_UNAVAILABLE", f"Vlan{vlan}"
+
+        if (input_rate or 0) > 0 or (output_rate or 0) > 0:
+            return "TRAFFIC_DETECTED", f"Vlan{vlan}"
+
+        return "NO_TRAFFIC", f"Vlan{vlan}"
+
+    except Exception:
+        return "TRAFFIC_UNAVAILABLE", f"Vlan{vlan}"
+
+
 def check_root(connection, vlan):
     try:
         output = connection.send_command(
@@ -322,13 +344,13 @@ def get_shutdown_recommendation(
     """Return recommendation strength and supporting reason.
 
     Strength levels:
-      STRONG   - no MACs, no ARPs, and confirmed no recent port traffic.
+      HIGHLY_RECOMMENDED - no MACs, no ARPs, and confirmed no recent traffic.
       MODERATE - no MACs and no ARPs, but traffic could not be confirmed.
       WEAK     - only one data source reports no endpoints.
       NONE     - insufficient evidence or the switch is the STP root.
 
     Conservative policy: TRAFFIC_UNAVAILABLE, NOT_CHECKED, and
-    NO_ACCESS_PORTS cannot produce a STRONG recommendation.
+    NO_ACCESS_PORTS cannot produce a HIGHLY_RECOMMENDED result.
     """
     if is_root:
         return (
@@ -339,19 +361,25 @@ def get_shutdown_recommendation(
     if mac_count == 0 and arp_count == 0:
         if traffic_check == "NO_TRAFFIC":
             return (
-                "STRONG",
-                "No dynamic MACs, no ARP entries, and no recent traffic",
+                "HIGHLY_RECOMMENDED",
+                "No MACs, no ARPs, and no recent SVI traffic",
+            )
+
+        if traffic_check == "TRAFFIC_DETECTED":
+            return (
+                "NONE",
+                "Traffic detected despite empty MAC and ARP tables",
             )
 
         if traffic_check in TRAFFIC_NOT_CONFIRMED:
             return (
                 "MODERATE",
-                "No dynamic MACs or ARP entries; traffic could not be confirmed",
+                "No MACs or ARPs; traffic could not be confirmed",
             )
 
         return (
             "MODERATE",
-            "No dynamic MACs or ARP entries; traffic evidence was inconclusive",
+            "No MACs or ARPs; traffic evidence was inconclusive",
         )
 
     if mac_count == 0 or arp_count == 0:
@@ -474,7 +502,13 @@ def process_switch(
 
             traffic_check = "NOT_CHECKED"
             traffic_ports = ""
-            if (
+
+            if mac_count == 0 and arp_count == 0:
+                traffic_check, traffic_ports = check_svi_traffic(
+                    connection,
+                    vlan_id,
+                )
+            elif (
                 1 <= mac_count <= max_mac_count
                 or 1 <= arp_count <= max_arp_count
             ):
@@ -722,13 +756,20 @@ def display_results(results, max_mac_count, max_arp_count):
             for row in results
             if row["Shutdown_Recommendation"] == level
         )
-        for level in ("STRONG", "MODERATE", "WEAK")
+        for level in (
+            "HIGHLY_RECOMMENDED",
+            "MODERATE",
+            "WEAK",
+        )
     }
 
     print("\n" + "=" * 270)
     print(f"Total VLANs Processed : {len(results)}")
     print(f"Total Root VLANs      : {root_count}")
-    print(f"Strong Recommendations: {recommendation_counts['STRONG']}")
+    print(
+        "Highly Recommended    : "
+        f"{recommendation_counts['HIGHLY_RECOMMENDED']}"
+    )
     print(f"Moderate Recommendations: {recommendation_counts['MODERATE']}")
     print(f"Weak Recommendations  : {recommendation_counts['WEAK']}")
     print("=" * 270)
