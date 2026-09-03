@@ -364,9 +364,9 @@ def check_root(connection, vlan):
             f"show spanning-tree vlan {vlan}",
             read_timeout=30,
         )
-        return "This bridge is the root" in output
-    except Exception:
-        return False
+        return "This bridge is the root" in output, ""
+    except Exception as error:
+        return False, f"STP root check failed: {error}"
 
 
 def parse_svi_inventory(output):
@@ -636,11 +636,21 @@ def get_shutdown_recommendation(
     mac_count,
     arp_count,
     traffic_check,
+    svi_present,
     is_root,
     dependency_reasons=None,
     dependency_checks_complete=True,
 ):
-    """Return recommendation strength and supporting reason."""
+    """Return recommendation strength and supporting reason.
+
+    HIGHLY_RECOMMENDED requires every safety condition to be true:
+      - zero dynamic MAC addresses
+      - zero ARP entries
+      - no SVI configured for the VLAN
+      - no traffic
+      - no trunk or P2P dependency
+      - confirmed non-root status
+    """
     dependency_reasons = dependency_reasons or []
 
     if is_root:
@@ -662,16 +672,22 @@ def get_shutdown_recommendation(
         )
 
     if mac_count == 0 and arp_count == 0:
-        if traffic_check == "NO_TRAFFIC":
+        if not svi_present and traffic_check == "NO_SVI":
             return (
                 "HIGHLY_RECOMMENDED",
-                "No MACs, no ARPs, and no recent SVI traffic",
+                "No MACs, no ARPs, no SVI, no traffic, no trunk/P2P dependency, and not STP root",
             )
 
         if traffic_check == "TRAFFIC_DETECTED":
             return (
                 "NONE",
                 "Traffic detected despite empty MAC and ARP tables",
+            )
+
+        if svi_present:
+            return (
+                "MODERATE",
+                "No MACs or ARPs and no traffic, but an SVI is configured",
             )
 
         if traffic_check in TRAFFIC_NOT_CONFIRMED:
@@ -682,7 +698,7 @@ def get_shutdown_recommendation(
 
         return (
             "MODERATE",
-            "No MACs or ARPs; traffic evidence was inconclusive",
+            "No MACs or ARPs; required shutdown conditions were not fully confirmed",
         )
 
     if mac_count == 0 or arp_count == 0:
@@ -817,7 +833,11 @@ def process_switch(
             traffic_check = "NOT_CHECKED"
             traffic_ports = ""
 
-            if mac_count == 0 and arp_count == 0:
+            svi_present = vlan_id in dependency_context["svi_inventory"]
+            if mac_count == 0 and arp_count == 0 and not svi_present:
+                traffic_check = "NO_SVI"
+                traffic_ports = ""
+            elif mac_count == 0 and arp_count == 0:
                 traffic_check, traffic_ports = check_svi_traffic(
                     connection,
                     vlan_id,
@@ -843,11 +863,21 @@ def process_switch(
                 base_oid,
                 oui_registry,
             )
-            is_root = check_root(connection, vlan_id)
-            svi_state, svi_state_error = get_svi_oper_state(
-                connection,
-                vlan_id,
-            )
+            is_root, root_state_error = check_root(connection, vlan_id)
+            if svi_present:
+                svi_state, svi_state_error = get_svi_oper_state(
+                    connection,
+                    vlan_id,
+                )
+            else:
+                svi_state = {
+                    "state": "NOT_PRESENT",
+                    "admin_down": False,
+                    "interface_up": False,
+                    "protocol_up": False,
+                }
+                svi_state_error = ""
+
             vlan_member_ports, vlan_member_error = get_vlan_member_ports(
                 connection,
                 vlan_id,
@@ -866,6 +896,9 @@ def process_switch(
                     f"Active SVI associated with VLAN ({svi_state['state']})"
                 )
 
+            if root_state_error:
+                dependency_reasons.append(root_state_error)
+
             if svi_state_error:
                 dependency_reasons.append(svi_state_error)
 
@@ -878,9 +911,13 @@ def process_switch(
                     mac_count,
                     arp_count,
                     traffic_check,
+                    svi_present,
                     is_root,
                     dependency_reasons,
-                    not dependency_check_errors and not svi_state_error,
+                    not dependency_check_errors
+                    and not root_state_error
+                    and not svi_state_error
+                    and not vlan_member_error,
                 )
             )
 
@@ -903,7 +940,7 @@ def process_switch(
                 "Root_Bridge": "YES" if is_root else "NO",
                 "VLAN_SVI_Status": (
                     "SVI_PRESENT"
-                    if vlan_id in dependency_context["svi_inventory"]
+                    if svi_present
                     else "NO_SVI"
                 ),
                 "SVI_State": svi_state["state"],
