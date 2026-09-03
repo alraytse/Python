@@ -661,8 +661,9 @@ def get_shutdown_recommendation(
 
     if dependency_reasons:
         return (
-            "NONE",
-            "Shutdown blocked by dependency: " + " | ".join(dependency_reasons),
+            "MODERATE",
+            "Dependency requires review before shutdown: "
+            + " | ".join(dependency_reasons),
         )
 
     if not dependency_checks_complete:
