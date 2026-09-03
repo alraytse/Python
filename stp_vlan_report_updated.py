@@ -24,6 +24,40 @@ TRAFFIC_NOT_CONFIRMED = {
     "NO_ACCESS_PORTS",
 }
 
+P2P_DEPENDENCY_KEYWORDS = (
+    "p2p",
+    "point-to-point",
+    "point to point",
+    "transit",
+    "router",
+    "rtr",
+    "firewall",
+    "fw",
+    "wan",
+    "edge",
+    "upstream",
+    "downstream",
+    "peer",
+    "mpls",
+    "outside",
+    "inside",
+)
+
+SVI_DEPENDENCY_PATTERNS = (
+    (r"\bhsrp\b", "HSRP configured"),
+    (r"\bvrrp\b", "VRRP configured"),
+    (r"\bglbp\b", "GLBP configured"),
+    (r"^ip helper-address\b", "DHCP helper configured"),
+    (r"^ip dhcp relay\b", "DHCP relay configured"),
+    (r"^ip pim\b", "Multicast PIM configured"),
+    (r"^ip igmp\b", "IGMP configured"),
+    (r"^ip route\b", "Route configured under SVI"),
+    (r"^ipv6 address\b", "IPv6 address configured"),
+    (r"^vrf member\b", "VRF membership configured"),
+    (r"^fabric forwarding\b", "Fabric forwarding configured"),
+    (r"^service-policy\b", "Service policy configured"),
+)
+
 
 def parse_vlans(output):
     vlan_map = {}
@@ -335,27 +369,296 @@ def check_root(connection, vlan):
         return False
 
 
+def parse_svi_inventory(output):
+    """Parse configured VLAN SVIs and configuration dependencies."""
+    inventory = {}
+    current_vlan = None
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        match = re.match(r"^interface\s+Vlan(\d+)\s*$", line, re.IGNORECASE)
+
+        if match:
+            current_vlan = match.group(1)
+            inventory[current_vlan] = {
+                "description": "",
+                "ip_addresses": [],
+                "shutdown": False,
+                "dependency_lines": [],
+            }
+            continue
+
+        if current_vlan is None or not line:
+            continue
+
+        if line.lower() == "shutdown":
+            inventory[current_vlan]["shutdown"] = True
+        elif line.lower().startswith("description "):
+            inventory[current_vlan]["description"] = line.split(
+                " ",
+                1,
+            )[1].strip()
+        elif line.lower().startswith("ip address "):
+            inventory[current_vlan]["ip_addresses"].append(line)
+
+        for pattern, label in SVI_DEPENDENCY_PATTERNS:
+            if re.search(pattern, line, re.IGNORECASE):
+                inventory[current_vlan]["dependency_lines"].append(
+                    f"{label}: {line}"
+                )
+
+    return inventory
+
+
+def get_svi_inventory(connection):
+    try:
+        output = connection.send_command(
+            "show running-config | section ^interface Vlan",
+            read_timeout=30,
+        )
+        return parse_svi_inventory(output), ""
+    except Exception as error:
+        return {}, f"SVI configuration check failed: {error}"
+
+
+def parse_interface_descriptions(output):
+    """Return raw interface-description lines keyed by interface."""
+    descriptions = {}
+    pattern = re.compile(
+        r"^\s*((?:Eth(?:ernet)?|Po(?:rt-channel)?|"
+        r"port-channel|sup-eth|mgmt)\S*)\s+(.+)$",
+        re.IGNORECASE,
+    )
+
+    for line in output.splitlines():
+        match = pattern.match(line)
+        if match:
+            descriptions[match.group(1)] = line.strip()
+
+    return descriptions
+
+
+def get_interface_descriptions(connection):
+    try:
+        output = connection.send_command(
+            "show interface description",
+            read_timeout=30,
+        )
+        return parse_interface_descriptions(output), ""
+    except Exception as error:
+        return {}, f"Interface description check failed: {error}"
+
+
+def vlan_in_list(vlan, value):
+    """Return whether a VLAN appears in a comma/range VLAN list."""
+    target = int(vlan)
+
+    for token in re.findall(r"\d+(?:\s*-\s*\d+)?", value):
+        if "-" in token:
+            start, end = [int(part.strip()) for part in token.split("-")]
+            if start <= target <= end:
+                return True
+        elif int(token) == target:
+            return True
+
+    return False
+
+
+def parse_trunk_dependencies(output, vlan):
+    """Find trunk interfaces whose displayed VLAN list contains vlan."""
+    dependencies = []
+    in_allowed_section = False
+    port_pattern = re.compile(
+        r"^\s*((?:Eth(?:ernet)?|Po(?:rt-channel)?|"
+        r"port-channel)\S*)\s+(.+)$",
+        re.IGNORECASE,
+    )
+
+    for raw_line in output.splitlines():
+        line = raw_line.strip()
+        lower_line = line.lower()
+
+        if "vlans allowed on trunk" in lower_line:
+            in_allowed_section = True
+            continue
+
+        if in_allowed_section and (
+            "vlans allowed and active" in lower_line
+            or "vlans in spanning tree forwarding state" in lower_line
+        ):
+            in_allowed_section = False
+
+        if not in_allowed_section:
+            continue
+
+        match = port_pattern.match(line)
+        if match and vlan_in_list(vlan, match.group(2)):
+            dependencies.append(match.group(1))
+
+    return list(dict.fromkeys(dependencies))
+
+
+def get_trunk_output(connection):
+    try:
+        return connection.send_command(
+            "show interface trunk",
+            read_timeout=30,
+        ), ""
+    except Exception as error:
+        return "", f"Trunk dependency check failed: {error}"
+
+
+def get_dependency_context(connection):
+    svi_inventory, svi_error = get_svi_inventory(connection)
+    interface_descriptions, description_error = (
+        get_interface_descriptions(connection)
+    )
+    trunk_output, trunk_error = get_trunk_output(connection)
+
+    return {
+        "svi_inventory": svi_inventory,
+        "interface_descriptions": interface_descriptions,
+        "trunk_output": trunk_output,
+        "errors": [
+            error
+            for error in (svi_error, description_error, trunk_error)
+            if error
+        ],
+    }
+
+
+def get_svi_oper_state(connection, vlan):
+    """Return SVI operational state from show interface vlan output."""
+    try:
+        output = connection.send_command(
+            f"show interface vlan {vlan}",
+            read_timeout=30,
+        )
+        first_line = next(
+            (line.strip() for line in output.splitlines() if line.strip()),
+            "",
+        )
+        lower_output = output.lower()
+        admin_down = "administratively down" in lower_output
+        interface_up = bool(
+            re.search(r"\bvlan\d+\s+is\s+up\b", first_line, re.IGNORECASE)
+        )
+        protocol_up = "line protocol is up" in first_line.lower()
+
+        if admin_down:
+            state = "ADMINISTRATIVELY_DOWN"
+        elif interface_up and protocol_up:
+            state = "UP/UP"
+        elif interface_up:
+            state = "UP/PROTOCOL_DOWN"
+        else:
+            state = "DOWN"
+
+        return {
+            "state": state,
+            "admin_down": admin_down,
+            "interface_up": interface_up,
+            "protocol_up": protocol_up,
+        }, ""
+    except Exception as error:
+        return {
+            "state": "UNAVAILABLE",
+            "admin_down": False,
+            "interface_up": False,
+            "protocol_up": False,
+        }, f"SVI operational-state check failed: {error}"
+
+
+def get_vlan_member_ports(connection, vlan):
+    """Return access/trunk interface names listed for a VLAN."""
+    try:
+        output = connection.send_command(
+            f"show vlan id {vlan}",
+            read_timeout=30,
+        )
+        pattern = re.compile(
+            r"\b((?:Eth(?:ernet)?|Po(?:rt-channel)?|"
+            r"port-channel|sup-eth|mgmt)\S*)\b",
+            re.IGNORECASE,
+        )
+        ports = [match.group(1) for match in pattern.finditer(output)]
+        return list(dict.fromkeys(ports)), ""
+    except Exception as error:
+        return [], f"VLAN member-port check failed: {error}"
+
+
+def get_vlan_dependency_reasons(
+    vlan,
+    vlan_ids,
+    svi_inventory,
+    interface_descriptions,
+    trunk_output,
+    vlan_member_ports,
+):
+    """Return safety dependencies detected for a VLAN."""
+    vlan = str(vlan)
+    reasons = []
+    svi = svi_inventory.get(vlan)
+
+    if svi is not None:
+        reasons.extend(svi["dependency_lines"])
+        svi_text = " ".join(
+            [svi["description"]] + svi["ip_addresses"]
+        ).lower()
+
+        if any(keyword in svi_text for keyword in P2P_DEPENDENCY_KEYWORDS):
+            if "firewall" in svi_text or " fw" in f" {svi_text}":
+                reasons.append("Router-to-firewall/P2P indicator in SVI configuration")
+            else:
+                reasons.append("Router-to-router/P2P indicator in SVI configuration")
+
+        if re.search(r"/(30|31)\b", svi_text):
+            reasons.append("Routed point-to-point subnet (/30 or /31)")
+
+    trunk_ports = parse_trunk_dependencies(trunk_output, vlan)
+    if trunk_ports:
+        reasons.append(
+            "VLAN allowed on trunk(s): " + ", ".join(trunk_ports)
+        )
+
+    for interface in vlan_member_ports:
+        description = interface_descriptions.get(interface, "")
+        lower_description = description.lower()
+        if any(keyword in lower_description for keyword in P2P_DEPENDENCY_KEYWORDS):
+            reasons.append(
+                f"P2P/router/firewall indicator on {interface}: {description}"
+            )
+
+    return list(dict.fromkeys(reasons))
+
+
 def get_shutdown_recommendation(
     mac_count,
     arp_count,
     traffic_check,
     is_root,
+    dependency_reasons=None,
+    dependency_checks_complete=True,
 ):
-    """Return recommendation strength and supporting reason.
+    """Return recommendation strength and supporting reason."""
+    dependency_reasons = dependency_reasons or []
 
-    Strength levels:
-      HIGHLY_RECOMMENDED - no MACs, no ARPs, and confirmed no recent traffic.
-      MODERATE - no MACs and no ARPs, but traffic could not be confirmed.
-      WEAK     - only one data source reports no endpoints.
-      NONE     - insufficient evidence or the switch is the STP root.
-
-    Conservative policy: TRAFFIC_UNAVAILABLE, NOT_CHECKED, and
-    NO_ACCESS_PORTS cannot produce a HIGHLY_RECOMMENDED result.
-    """
     if is_root:
         return (
             "NONE",
             "STP root bridge; do not recommend shutdown without topology review",
+        )
+
+    if dependency_reasons:
+        return (
+            "NONE",
+            "Shutdown blocked by dependency: " + " | ".join(dependency_reasons),
+        )
+
+    if not dependency_checks_complete:
+        return (
+            "MODERATE",
+            "Dependency checks incomplete; safe shutdown cannot be confirmed",
         )
 
     if mac_count == 0 and arp_count == 0:
@@ -390,7 +693,6 @@ def get_shutdown_recommendation(
         )
 
     return "NONE", "Active MAC and ARP entries detected"
-
 
 def get_svi_info(connection, vlan, base_oid, oui_registry):
     description = ""
@@ -473,8 +775,20 @@ def process_switch(
             read_timeout=30,
         )
         vlans = parse_vlans(vlan_output)
+        vlan_ids = {vlan["vlan"] for vlan in vlans}
+        dependency_context = get_dependency_context(connection)
         arp_entries, arp_available = get_arp_table(connection)
         print(f"{hostname}: Found {len(vlans)} VLANs")
+
+        orphan_svis = sorted(
+            set(dependency_context["svi_inventory"]) - vlan_ids,
+            key=int,
+        )
+        if orphan_svis:
+            print(
+                f"{hostname}: VLAN/SVI mismatch detected; "
+                f"SVIs without VLANs: {', '.join(orphan_svis)}"
+            )
 
         for vlan_info in vlans:
             vlan_id = vlan_info["vlan"]
@@ -530,12 +844,43 @@ def process_switch(
                 oui_registry,
             )
             is_root = check_root(connection, vlan_id)
+            svi_state, svi_state_error = get_svi_oper_state(
+                connection,
+                vlan_id,
+            )
+            vlan_member_ports, vlan_member_error = get_vlan_member_ports(
+                connection,
+                vlan_id,
+            )
+            dependency_reasons = get_vlan_dependency_reasons(
+                vlan_id,
+                vlan_ids,
+                dependency_context["svi_inventory"],
+                dependency_context["interface_descriptions"],
+                dependency_context["trunk_output"],
+                vlan_member_ports,
+            )
+
+            if svi_state["interface_up"] or svi_state["protocol_up"]:
+                dependency_reasons.append(
+                    f"Active SVI associated with VLAN ({svi_state['state']})"
+                )
+
+            if svi_state_error:
+                dependency_reasons.append(svi_state_error)
+
+            if vlan_member_error:
+                dependency_reasons.append(vlan_member_error)
+
+            dependency_check_errors = dependency_context["errors"]
             recommendation_strength, recommendation_reason = (
                 get_shutdown_recommendation(
                     mac_count,
                     arp_count,
                     traffic_check,
                     is_root,
+                    dependency_reasons,
+                    not dependency_check_errors and not svi_state_error,
                 )
             )
 
@@ -556,8 +901,55 @@ def process_switch(
                 "ARP_Check": arp_check,
                 "ARP_Missing_MACs": arp_missing_macs,
                 "Root_Bridge": "YES" if is_root else "NO",
+                "VLAN_SVI_Status": (
+                    "SVI_PRESENT"
+                    if vlan_id in dependency_context["svi_inventory"]
+                    else "NO_SVI"
+                ),
+                "SVI_State": svi_state["state"],
+                "Dependency_Check": (
+                    "BLOCKED"
+                    if dependency_reasons
+                    else "CLEAR"
+                    if not dependency_check_errors and not svi_state_error
+                    else "INCOMPLETE"
+                ),
+                "Dependency_Details": "; ".join(
+                    dependency_reasons + dependency_check_errors
+                ),
+                "VLAN_Member_Ports": "; ".join(vlan_member_ports),
                 "Shutdown_Recommendation": recommendation_strength,
                 "Shutdown_Recommendation_Reason": recommendation_reason,
+            })
+
+        for orphan_vlan in orphan_svis:
+            orphan_svi = dependency_context["svi_inventory"][orphan_vlan]
+            results.append({
+                "Device": hostname,
+                "VLAN": orphan_vlan,
+                "VLAN_Name": "<SVI WITHOUT VLAN>",
+                "SVI_IP": "; ".join(orphan_svi["ip_addresses"]),
+                "SVI_MAC": "",
+                "SVI_MAC_Company": "",
+                "SVI_Description": orphan_svi["description"],
+                "MAC_Count": "",
+                "ARP_Count": "",
+                "Traffic_Check": "NOT_CHECKED",
+                "Traffic_Ports": "",
+                "MAC_Address": "",
+                "MAC_Company": "",
+                "ARP_Check": "NOT_CHECKED",
+                "ARP_Missing_MACs": "",
+                "Root_Bridge": "UNKNOWN",
+                "VLAN_SVI_Status": "MISMATCH",
+                "SVI_State": "NOT_CHECKED",
+                "Dependency_Check": "BLOCKED",
+                "Dependency_Details": "SVI configured but VLAN is absent",
+                "VLAN_Member_Ports": "",
+                "Shutdown_Recommendation": "NONE",
+                "Shutdown_Recommendation_Reason": (
+                    "VLAN/SVI mismatch; SVI exists without corresponding VLAN"
+                ),
             })
 
     except Exception as error:
@@ -651,6 +1043,11 @@ def write_csv(results, csv_file):
         "ARP_Check",
         "ARP_Missing_MACs",
         "Root_Bridge",
+        "VLAN_SVI_Status",
+        "SVI_State",
+        "Dependency_Check",
+        "Dependency_Details",
+        "VLAN_Member_Ports",
         "Shutdown_Recommendation",
         "Shutdown_Recommendation_Reason",
     ]
@@ -737,6 +1134,31 @@ def display_results(results, max_mac_count, max_arp_count):
             print(f"{'':<8}{'MACs missing ARP: ' + row['ARP_Missing_MACs']}")
         if row["SVI_Description"]:
             print(f"{'':<8}{'SVI Description: ' + row['SVI_Description']}")
+        if row["VLAN_SVI_Status"]:
+            print(
+                f"{'':<8}"
+                f"VLAN/SVI status: {row['VLAN_SVI_Status']}"
+            )
+        if row["SVI_State"]:
+            print(
+                f"{'':<8}"
+                f"SVI state: {row['SVI_State']}"
+            )
+        if row["Dependency_Check"]:
+            print(
+                f"{'':<8}"
+                f"Dependency check: {row['Dependency_Check']}"
+            )
+        if row["Dependency_Details"]:
+            print(
+                f"{'':<8}"
+                f"Dependencies: {row['Dependency_Details']}"
+            )
+        if row["VLAN_Member_Ports"]:
+            print(
+                f"{'':<8}"
+                f"VLAN member ports: {row['VLAN_Member_Ports']}"
+            )
         if row["Shutdown_Recommendation_Reason"]:
             print(
                 f"{'':<8}"
