@@ -656,6 +656,8 @@ NAT_RULE_FIELDS = [
     "Device",
     "Platform",
     "Rule_Type",
+    "NAT",
+    "PAT",
     "Original_Source",
     "Translated_Source",
     "Original_Destination",
@@ -693,6 +695,8 @@ def nat_rule_row(
         "Device": device,
         "Platform": platform,
         "Rule_Type": rule_type,
+        "NAT": "Configured" if rule_type in {"NAT", "STATIC_NAT"} else "N/A",
+        "PAT": "Configured" if rule_type == "PAT" else "N/A",
         "Original_Source": original_source,
         "Translated_Source": translated_source,
         "Original_Destination": original_destination,
@@ -916,6 +920,16 @@ def parse_configured_nat_output(output, device, platform, command):
     return rows
 
 
+def no_nat_rule_row(device, platform, command=""):
+    return nat_rule_row(
+        device=device,
+        platform=platform,
+        command=command,
+        details="No configured NAT or PAT rules found",
+        rule_type="N/A",
+    )
+
+
 def collect_nxos_nat_rules(connection, device):
     """Collect configured NX-OS NAT/PAT rules, not active translations."""
     commands = (
@@ -928,7 +942,8 @@ def collect_nxos_nat_rules(connection, device):
         output = safe_send_command(connection, command, read_timeout=60)
         if output:
             rows.extend(parse_configured_nat_output(output, device, "cisco_nxos", command))
-    return _dedupe_nat_rules(rows)
+    rows = _dedupe_nat_rules(rows)
+    return rows or [no_nat_rule_row(device, "cisco_nxos")]
 
 
 def _dedupe_nat_rules(rows):
@@ -1204,6 +1219,7 @@ def collect_firewall(device, username, password, platform):
     connection = None
     inventory_rows = []
     nat_rule_rows = []
+    device_name = device["host"]
     try:
         print(f"\nConnecting to firewall {device['host']} ({platform})...")
         connection = connect_handler(
@@ -1246,7 +1262,8 @@ def collect_firewall(device, username, password, platform):
     finally:
         if connection:
             connection.disconnect()
-    return inventory_rows, _dedupe_nat_rules(nat_rule_rows)
+    nat_rule_rows = _dedupe_nat_rules(nat_rule_rows)
+    return inventory_rows, (nat_rule_rows or [no_nat_rule_row(device_name, platform)])
 
 
 def collect_firewalls(hosts, username, password, platform, workers):
