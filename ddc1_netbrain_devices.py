@@ -246,14 +246,29 @@ class NetBrainClient:
 
 
 def first_value(obj: Any, paths: Iterable[str], default: Any = None) -> Any:
+    """Read a value using case-insensitive key matching."""
     for path in paths:
         value = obj
         found = True
         for part in path.split("."):
-            if not isinstance(value, dict) or part not in value:
+            if not isinstance(value, dict):
                 found = False
                 break
-            value = value[part]
+
+            if part in value:
+                value = value[part]
+                continue
+
+            normalized_part = re_key(part)
+            matching_key = next(
+                (key for key in value if re_key(key) == normalized_part),
+                None,
+            )
+            if matching_key is None:
+                found = False
+                break
+            value = value[matching_key]
+
         if found and value not in (None, ""):
             return value
     return default
@@ -422,7 +437,19 @@ def is_switch(device: Dict[str, Any]) -> bool:
 
 
 def device_key(device: Dict[str, Any]) -> Tuple[str, str, str]:
-    return device_id(device).casefold(), device_name(device).casefold(), management_ip(device).casefold()
+    identity = (
+        device_id(device).casefold(),
+        device_name(device).casefold(),
+        management_ip(device).casefold(),
+    )
+    if any(identity):
+        return identity
+
+    # Preserve records even when an API response uses unfamiliar identity
+    # field names. Without this fallback, every such record becomes ("", "", "")
+    # and deduplication incorrectly keeps only one device.
+    canonical = json.dumps(device, sort_keys=True, default=str, separators=(",", ":"))
+    return ("raw:" + canonical, "", "")
 
 
 def interface_value(interface: Dict[str, Any], names: Iterable[str]) -> str:
