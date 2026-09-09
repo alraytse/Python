@@ -37,11 +37,15 @@ LOGIN_PATH = "/ServicesAPI/API/V1/Session"
 DEVICES_PATH = "/ServicesAPI/API/V1/CMDB/Devices"
 DEFAULT_INTERFACES_PATH = "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/Interfaces"
 INTERFACE_REPORT_FIELDS = [
-    "InterfaceName", "InterfaceType", "VRFName", "InterfaceDescription",
-    "AdminStatus", "OperStatus", "Speed", "VLAN", "IPAddress",
-    "_device_id", "_device_name", "_management_ip", "_site_match_status",
+    "Management IP",
+    "Device Name",
+    "Display Name",
+    "Device Type",
+    "Device Category",
+    "Requested Site",
+    "Interface Type",
+    "VRF Name",
 ]
-
 
 class NetBrainClient:
     def __init__(self, base_url: str, insecure: bool = True, timeout: int = 60):
@@ -499,7 +503,6 @@ def deduplicate_devices(raw_pages: List[Any]) -> Tuple[List[Dict[str, Any]], Lis
             "UniquePageCount": len(pages_seen),
             "FirstPageSeen": pages_seen[0],
             "LastPageSeen": pages_seen[-1],
-            "PagesSeen": ",".join(str(page) for page in pages_seen),
             "RepeatedAcrossPages": "YES" if len(items) > 1 else "NO",
             "RequestedSite": DEFAULT_SITE_FILTER,
             "SiteFieldPresent": "YES" if site_values_found else "NO",
@@ -513,7 +516,6 @@ def deduplicate_devices(raw_pages: List[Any]) -> Tuple[List[Dict[str, Any]], Lis
             "_unique_page_count": len(pages_seen),
             "_first_page_seen": pages_seen[0],
             "_last_page_seen": pages_seen[-1],
-            "_pages_seen": ",".join(str(page) for page in pages_seen),
             "_repeated_across_pages": "YES" if len(items) > 1 else "NO",
             "_display_name": raw_ip if raw_name in ("", "(none)") else raw_name,
             "_device_category": category(subtype),
@@ -585,22 +587,18 @@ def collect_interfaces(
             rows = []
             for interface in interfaces:
                 if isinstance(interface, dict):
-                    row = flatten_json(interface)
-                    row.update({
-                        "InterfaceName": interface_name(interface),
-                        "InterfaceType": interface_type(interface),
-                        "VRFName": vrf_name(interface),
-                        "InterfaceDescription": str(first_value(interface, ("description", "desc", "interfaceDescription"), "")),
-                        "AdminStatus": str(first_value(interface, ("adminStatus", "administrativeStatus", "admin_state"), "")),
-                        "OperStatus": str(first_value(interface, ("operStatus", "operationalStatus", "status", "linkStatus"), "")),
-                        "Speed": str(first_value(interface, ("speed", "bandwidth", "interfaceSpeed", "speedMbps"), "")),
-                        "VLAN": str(first_value(interface, ("vlan", "vlanId", "vlanID", "accessVlan", "nativeVlan"), "")),
-                        "_device_id": device_id_value,
-                        "_device_name": device_name(device),
-                        "_management_ip": management_ip(device),
-                        "_site_match_status": site_match_status(device, DEFAULT_SITE_FILTER),
+                    subtype = first_value(device, ("subTypeName", "deviceType", "type"), "")
+                    raw_name = device_name(device)
+                    rows.append({
+                        "Management IP": management_ip(device),
+                        "Device Name": raw_name,
+                        "Display Name": management_ip(device) if raw_name in ("", "(none)") else raw_name,
+                        "Device Type": str(subtype),
+                        "Device Category": category(subtype),
+                        "Requested Site": DEFAULT_SITE_FILTER,
+                        "Interface Type": interface_type(interface),
+                        "VRF Name": vrf_name(interface),
                     })
-                    rows.append(row)
             return index, rows, f"Interfaces {index}/{len(devices)}: {device_name(device) or device_id_value} -> {len(interfaces)}"
         except Exception as error:
             return index, [], f"Interface lookup failed for {device_name(device) or device_id_value}: {error}"
@@ -651,7 +649,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Skip interface collection.",
     )
     parser.set_defaults(collect_interfaces=True)
-    parser.add_argument("--interfaces-csv-file", default="netbrain_interfaces_all_columns.csv")
+    parser.add_argument("--interfaces-csv-file", default="netbrain_interface_report.csv")
     parser.add_argument("--interfaces-path-template", default=DEFAULT_INTERFACES_PATH)
     return parser
 
