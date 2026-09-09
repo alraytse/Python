@@ -49,7 +49,6 @@ COMMON_INTERFACE_PATHS = (
     "/ServicesAPI/API/V1/CMDB/Ports?deviceId={device_id}",
 )
 INTERFACE_REPORT_FIELDS = [
-    "Device ID",
     "Management IP",
     "Device Name",
     "Display Name",
@@ -63,8 +62,6 @@ INTERFACE_REPORT_FIELDS = [
     "Interface IPs",
     "Interface Status",
     "VRF Name",
-    "Collection Status",
-    "Collection Error",
 ]
 
 
@@ -415,20 +412,33 @@ def extract_ip_addresses(value: Any, key_hint: str = "") -> List[str]:
 
 
 def interface_category(interface: Dict[str, Any]) -> str:
-    name = interface_name(interface).casefold()
-    kind = interface_type(interface).casefold()
-    combined = f"{name} {kind}"
-    virtual_markers = (
-        "vlan", "svi", "loopback", "loop", "port-channel", "portchannel", "bundle",
-        "etherchannel", "tunnel", "virtual", "subinterface", "bvi", "bridge", "vxlan",
+    """Classify an interface from its name and type, not from device metadata."""
+    name = interface_name(interface).strip().casefold()
+    kind = interface_type(interface).strip().casefold()
+
+    virtual_name_patterns = (
+        r"^(vlan|svi)\d*([./].*)?$",
+        r"^(loopback|lo)\d*([./].*)?$",
+        r"^(port[- ]?channel|portchannel|po)\d+([./].*)?$",
+        r"^(bundle|tunnel|tun|bvi|bridge|vxlan)\d*([./].*)?$",
     )
-    physical_markers = (
-        "ethernet", "gigabitethernet", "tengigabitethernet", "fastethernet", "fortygig",
-        "hundredgig", "eth", "xe-", "ge-", "et-", "fe-",
+    physical_name_patterns = (
+        r"^(ethernet|eth|fastethernet|fa)\d+([/.:].*)?$",
+        r"^(gigabitethernet|gi)\d+([/.:].*)?$",
+        r"^(tengigabitethernet|te)\d+([/.:].*)?$",
+        r"^(fortygigabitethernet|fo)\d+([/.:].*)?$",
+        r"^(hundredgigabitethernet|hu)\d+([/.:].*)?$",
+        r"^(xe-|ge-|et-|fe-)\S+$",
     )
-    if any(marker in combined for marker in virtual_markers):
+
+    if any(re.match(pattern, name) for pattern in virtual_name_patterns):
         return "Virtual"
-    if any(marker in combined for marker in physical_markers):
+    if any(re.match(pattern, name) for pattern in physical_name_patterns):
+        return "Physical"
+
+    if any(word in kind for word in ("virtual", "svi", "loopback", "port-channel", "portchannel", "tunnel")):
+        return "Virtual"
+    if any(word in kind for word in ("physical", "ethernet", "gigabit", "fastethernet", "fiber", "copper")):
         return "Physical"
     return "Unknown"
 
@@ -695,7 +705,6 @@ def interface_rows_for_device(
     for interface in interfaces:
         ips = extract_ip_addresses(interface)
         result.append({
-            "Device ID": device_id(device),
             "Management IP": management,
             "Device Name": raw_name,
             "Display Name": management if raw_name in ("", "(none)") else raw_name,
@@ -709,8 +718,6 @@ def interface_rows_for_device(
             "Interface IPs": "; ".join(ips),
             "Interface Status": interface_status(interface),
             "VRF Name": vrf_name(interface),
-            "Collection Status": collection_status,
-            "Collection Error": collection_error,
         })
     return result
 
