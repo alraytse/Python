@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import getpass
 import hashlib
+import ipaddress
 import json
 import re
 import sys
@@ -286,6 +287,19 @@ def management_ip(device: Dict[str, Any]) -> str:
     return str(first_value(device, ("mgmtIP", "managementIP", "ipAddress", "ip"), ""))
 
 
+def interface_type(interface: Dict[str, Any]) -> str:
+    return str(first_value(interface, (
+        "interfaceType", "ifType", "portType", "mediaType",
+        "interfaceKind", "interfaceClass", "subTypeName", "type",
+    ), ""))
+
+
+def interface_name(interface: Dict[str, Any]) -> str:
+    return str(first_value(interface, (
+        "name", "interfaceName", "ifName", "portName", "port", "displayName",
+    ), ""))
+
+
 def site_values(device: Dict[str, Any]) -> List[str]:
     values = []
     wanted = {re_key(name) for name in (
@@ -327,6 +341,48 @@ def category(subtype: Any) -> str:
     if "unclassified" in value:
         return "Unclassified"
     return "Other"
+
+
+def ip_metadata(value: Any) -> Tuple[str, str, str]:
+    try:
+        address = ipaddress.ip_address(str(value))
+        version = f"IPv{address.version}"
+        scope = "Private" if address.is_private else "Public"
+        return version, scope, "VALID"
+    except ValueError:
+        return "", "", "INVALID_OR_MISSING"
+
+
+def name_type(name: Any) -> str:
+    value = str(name or "")
+    if not value or value == "(none)":
+        return "MISSING"
+    try:
+        ipaddress.ip_address(value)
+        return "IP_ADDRESS"
+    except ValueError:
+        pass
+    if re.fullmatch(r"[0-9a-fA-F]{8}-[0-9a-fA-F-]{27,}", value):
+        return "UUID_LIKE"
+    if "." in value:
+        return "FQDN_OR_HOSTNAME"
+    return "HOSTNAME_OR_LABEL"
+
+
+def discovery_recency(value: Any) -> Tuple[str, Any]:
+    timestamp = parse_time(value)
+    if not timestamp:
+        return "UNKNOWN", ""
+    age_hours = round((datetime.now(timezone.utc) - timestamp).total_seconds() / 3600, 1)
+    if age_hours < 0:
+        status = "FUTURE_OR_CLOCK_SKEW"
+    elif age_hours <= 24:
+        status = "WITHIN_24_HOURS"
+    elif age_hours <= 168:
+        status = "WITHIN_7_DAYS"
+    else:
+        status = "OLDER_THAN_7_DAYS"
+    return status, age_hours
 
 
 def parse_time(value: Any) -> Optional[datetime]:
@@ -380,8 +436,56 @@ def deduplicate_devices(raw_pages: List[Any]) -> Tuple[List[Dict[str, Any]], Lis
         first_dt = parse_time(first_time)
         last_dt = parse_time(last_time)
         pages_seen = sorted({page_no for page_no, _ in items})
+        raw_ip = management_ip(representative)
+        raw_name = device_name(representative)
+        ip_version, ip_scope, ip_status = ip_metadata(raw_ip)
+        recency_status, age_hours = discovery_recency(last_time)
+        site_values_found = site_values(representative)
+        site_status = site_match_status(representative, DEFAULT_SITE_FILTER)
+        issues = []
+        if not raw_name or raw_name == "(none)":
+            issues.append("MISSING_NAME")
+        if ip_status != "VALID":
+            issues.append("INVALID_OR_MISSING_IP")
+        if category(subtype) == "Unclassified":
+            issues.append("UNCLASSIFIED_DEVICE")
+        if len(items) > 1:
+            issues.append("REPEATED_API_RECORD")
+        if not site_values_found:
+            issues.append("NO_SITE_FIELD")
         row = flatten_json(representative)
         row.update({
+            # Friendly report columns.
+            "DeviceID": device_id(representative),
+            "ManagementIP": raw_ip,
+            "DeviceName": raw_name,
+            "DisplayName": raw_ip if raw_name in ("", "(none)") else raw_name,
+            "DeviceType": subtype,
+            "DeviceCategory": category(subtype),
+            "ClassificationStatus": "UNCLASSIFIED" if category(subtype) == "Unclassified" else "CLASSIFIED",
+            "LikelyNetworkDevice": "YES" if category(subtype) in {"Switch", "Firewall", "Router"} else "NO",
+            "NameType": name_type(raw_name),
+            "IPVersion": ip_version,
+            "IPScope": ip_scope,
+            "IPValidation": ip_status,
+            "FirstDiscoveryUTC": first_time,
+            "LastDiscoveryUTC": last_time,
+            "DiscoveryRecency": recency_status,
+            "LastDiscoveryAgeHours": age_hours,
+            "DiscoverySpanDays": round((last_dt - first_dt).total_seconds() / 86400, 2) if first_dt and last_dt else "",
+            "RawOccurrenceCount": len(items),
+            "UniquePageCount": len(pages_seen),
+            "FirstPageSeen": pages_seen[0],
+            "LastPageSeen": pages_seen[-1],
+            "PagesSeen": ",".join(str(page) for page in pages_seen),
+            "RepeatedAcrossPages": "YES" if len(items) > 1 else "NO",
+            "RequestedSite": DEFAULT_SITE_FILTER,
+            "SiteFieldPresent": "YES" if site_values_found else "NO",
+            "SiteValues": "; ".join(site_values_found),
+            "SiteMatchStatus": site_status,
+            "DataQualityStatus": "OK" if not issues else "REVIEW_REQUIRED",
+            "DataQualityIssues": ";".join(issues),
+            # Backward-compatible internal report columns.
             "_identity": identity,
             "_raw_occurrence_count": len(items),
             "_unique_page_count": len(pages_seen),
@@ -389,14 +493,14 @@ def deduplicate_devices(raw_pages: List[Any]) -> Tuple[List[Dict[str, Any]], Lis
             "_last_page_seen": pages_seen[-1],
             "_pages_seen": ",".join(str(page) for page in pages_seen),
             "_repeated_across_pages": "YES" if len(items) > 1 else "NO",
-            "_display_name": management_ip(representative) if device_name(representative) in ("", "(none)") else device_name(representative),
+            "_display_name": raw_ip if raw_name in ("", "(none)") else raw_name,
             "_device_category": category(subtype),
             "_classification_status": "UNCLASSIFIED" if category(subtype) == "Unclassified" else "CLASSIFIED",
             "_likely_network_device": "YES" if category(subtype) in {"Switch", "Firewall", "Router"} else "NO",
             "_first_last_discovery_span_days": round((last_dt - first_dt).total_seconds() / 86400, 2) if first_dt and last_dt else "",
             "_requested_site": DEFAULT_SITE_FILTER,
-            "_site_values": "; ".join(site_values(representative)),
-            "_site_match_status": site_match_status(representative, DEFAULT_SITE_FILTER),
+            "_site_values": "; ".join(site_values_found),
+            "_site_match_status": site_status,
         })
         inventory.append(row)
     return inventory, audit
@@ -457,6 +561,13 @@ def collect_interfaces(
                 if isinstance(interface, dict):
                     row = flatten_json(interface)
                     row.update({
+                        "InterfaceName": interface_name(interface),
+                        "InterfaceType": interface_type(interface),
+                        "InterfaceDescription": str(first_value(interface, ("description", "desc", "interfaceDescription"), "")),
+                        "AdminStatus": str(first_value(interface, ("adminStatus", "administrativeStatus", "admin_state"), "")),
+                        "OperStatus": str(first_value(interface, ("operStatus", "operationalStatus", "status", "linkStatus"), "")),
+                        "Speed": str(first_value(interface, ("speed", "bandwidth", "interfaceSpeed", "speedMbps"), "")),
+                        "VLAN": str(first_value(interface, ("vlan", "vlanId", "vlanID", "accessVlan", "nativeVlan"), "")),
                         "_device_id": device_id_value,
                         "_device_name": device_name(device),
                         "_management_ip": management_ip(device),
