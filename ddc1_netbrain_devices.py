@@ -89,91 +89,137 @@ class NetBrainClient:
         max_pages: int = DEFAULT_MAX_PAGES,
         page_param: str = "pageNo",
         page_size_param: str = "pageSize",
-    ) -> Tuple[List[Dict[str, Any]], Any]:
-        """Return unique device records and the first raw API response.
+    ) -> Tuple[List[Dict[str, Any]], List[Any]]:
+        """Return unique devices and every raw page response.
 
-        NetBrain deployments differ in pagination behavior. The first request
-        is unmodified because it is known to work. Subsequent requests use the
-        configured page parameters only while new unique records are returned.
-        The raw first response is retained for schema troubleshooting.
+        NetBrain installations vary in pagination names and indexing. The
+        first request is unmodified, then the script probes common patterns
+        until one returns records not already seen. It continues only with a
+        pattern that produces new unique records, preventing duplicate pages
+        from being mistaken for a complete inventory.
         """
         all_devices: List[Dict[str, Any]] = []
         seen: Set[Tuple[str, str, str]] = set()
-        first_response: Any = None
-        response: Any = self.request("GET", DEVICES_PATH)
-        first_response = response
+        raw_responses: List[Any] = []
 
-        for page_number in range(1, max_pages + 1):
+        def absorb(response: Any, label: str) -> Tuple[int, int]:
             records = extract_records(response, (
                 "devices", "deviceList", "records", "items", "results", "data",
             ))
             page_devices = [record for record in records if isinstance(record, dict)]
             new_count = 0
-
             for device in page_devices:
                 key = device_key(device)
                 if key not in seen:
                     seen.add(key)
                     all_devices.append(device)
                     new_count += 1
-
             print(
-                f"Retrieved device page {page_number}: "
-                f"{len(page_devices)} records ({new_count} new)"
+                f"Retrieved {label}: {len(page_devices)} records "
+                f"({new_count} new; {len(all_devices)} total unique)"
+            )
+            return len(page_devices), new_count
+
+        first_response = self.request("GET", DEVICES_PATH)
+        raw_responses.append(first_response)
+        first_count, _ = absorb(first_response, "initial device page")
+
+        # Each tuple is (label, query-builder, first value representing the
+        # second page). The initial unmodified response is treated as page 1.
+        candidates = [
+            (
+                "configured pagination",
+                lambda value: {page_param: value, page_size_param: page_size},
+                2,
+            ),
+            (
+                "pageNo/pageSize (zero-based probe)",
+                lambda value: {"pageNo": value, "pageSize": page_size},
+                1,
+            ),
+            (
+                "pageIndex/pageSize",
+                lambda value: {"pageIndex": value, "pageSize": page_size},
+                1,
+            ),
+            (
+                "page/pageSize",
+                lambda value: {"page": value, "pageSize": page_size},
+                2,
+            ),
+            (
+                "offset/limit",
+                lambda value: {"offset": value, "limit": page_size},
+                page_size,
+            ),
+            (
+                "start/limit",
+                lambda value: {"start": value, "limit": page_size},
+                page_size,
+            ),
+            (
+                "skip/limit",
+                lambda value: {"skip": value, "limit": page_size},
+                page_size,
+            ),
+        ]
+
+        tried: Set[Tuple[str, str]] = set()
+        active = None
+        probe_response: Any = None
+        probe_value = None
+
+        for label, query_builder, first_value in candidates:
+            query = query_builder(first_value)
+            signature = tuple(sorted((str(key), str(value)) for key, value in query.items()))
+            if signature in tried:
+                continue
+            tried.add(signature)
+
+            try:
+                response = self.request("GET", DEVICES_PATH, params=query)
+            except Exception as error:
+                print(f"Pagination probe failed ({label}): {error}")
+                continue
+
+            raw_responses.append(response)
+            page_count, new_count = absorb(response, f"{label} probe")
+            if new_count > 0:
+                active = (label, query_builder)
+                probe_response = response
+                probe_value = first_value
+                print(f"Using pagination pattern: {label}")
+                break
+            if page_count == 0:
+                continue
+
+        if active is not None and probe_response is not None and probe_value is not None:
+            label, query_builder = active
+            for page_number in range(1, max_pages + 1):
+                value = probe_value + page_number
+                try:
+                    response = self.request(
+                        "GET",
+                        DEVICES_PATH,
+                        params=query_builder(value),
+                    )
+                except Exception as error:
+                    print(f"Pagination stopped at {label} value {value}: {error}")
+                    break
+
+                raw_responses.append(response)
+                page_count, new_count = absorb(response, f"{label} value {value}")
+                if page_count == 0 or new_count == 0 or page_count < page_size:
+                    break
+
+        if first_count == page_size and active is None:
+            print(
+                "WARNING: The API returned exactly one full page but none of the "
+                "pagination patterns produced new records. The endpoint may require "
+                "a NetBrain-specific filter or a different request method."
             )
 
-            if page_number > 1 and new_count == 0:
-                print("Pagination returned no new unique devices; stopping safely.")
-                break
-
-            next_url = find_first_key(response, {
-                "next", "nexturl", "nextpageurl", "nextlink",
-            })
-            next_token = find_first_key(response, {
-                "nexttoken", "nextpagetoken", "continuationtoken", "cursor",
-            })
-            has_more = find_boolean_key(response, {
-                "hasmore", "ismore", "moreavailable",
-            })
-            total = find_number_key(response, {
-                "total", "totalcount", "recordcount",
-            })
-
-            if has_more is None and total is not None:
-                has_more = len(all_devices) < total
-
-            if next_url:
-                response = self.request("GET", str(next_url))
-                continue
-
-            if next_token:
-                response = self.request(
-                    "GET",
-                    DEVICES_PATH,
-                    params={"pageToken": str(next_token)},
-                )
-                continue
-
-            if has_more is False:
-                break
-            if has_more is None and len(page_devices) < page_size:
-                break
-
-            next_page = page_number + 1
-            try:
-                response = self.request(
-                    "GET",
-                    DEVICES_PATH,
-                    params={
-                        page_param: next_page,
-                        page_size_param: page_size,
-                    },
-                )
-            except Exception as error:
-                print(f"Pagination request failed on page {next_page}: {error}")
-                break
-
-        return all_devices, first_response
+        return all_devices, raw_responses
 
     def get_interfaces(
         self,
@@ -544,13 +590,13 @@ def main() -> int:
         client.login(username, password, args.tenant_name, args.domain_name)
 
         print("\nRetrieving devices...")
-        all_devices, first_response = client.get_devices(
+        all_devices, raw_responses = client.get_devices(
             page_size=args.devices_page_size,
             max_pages=args.devices_max_pages,
             page_param=args.devices_page_param,
             page_size_param=args.devices_page_size_param,
         )
-        write_json(first_response, args.raw_json_file)
+        write_json(raw_responses, args.raw_json_file)
 
         matched_devices = [
             device for device in all_devices
