@@ -19,7 +19,8 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 LOGIN_PATH = "/ServicesAPI/API/V1/Session"
 DEVICES_PATH = "/ServicesAPI/API/V1/CMDB/Devices"
 DEFAULT_INTERFACES_PATH = "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/Interfaces"
-DEFAULT_SITE_FILTER = "DDC1"
+DEFAULT_BASE_URL = "https://netbrain.mckesson.com"
+DEFAULT_SITE_FILTER = "DDC"
 DEFAULT_PAGE_SIZE = 50
 DEFAULT_MAX_PAGES = 100
 
@@ -459,7 +460,7 @@ def display_devices(devices: List[Dict[str, Any]], site_filter: str, title: str)
 
 def display_interfaces(rows: List[Dict[str, str]]) -> None:
     print("\n" + "=" * 170)
-    print("DDC1 DEVICE INTERFACES")
+    print(f"{DEFAULT_SITE_FILTER} DEVICE INTERFACES")
     print("=" * 170)
     print(
         f"{'Device':<35}{'IP':<16}{'Interface':<24}{'Admin':<14}"
@@ -481,17 +482,30 @@ def display_interfaces(rows: List[Dict[str, str]]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Display NetBrain R12 devices and interfaces for site DDC1."
+        description="Display NetBrain R12 devices and interfaces for site DDC."
     )
-    parser.add_argument("--base-url", default="https://netbrain.mckesson.com")
-    parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification.")
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
+    security_group = parser.add_mutually_exclusive_group()
+    security_group.add_argument(
+        "--secure",
+        dest="insecure",
+        action="store_false",
+        help="Enable TLS certificate verification (default).",
+    )
+    security_group.add_argument(
+        "--insecure",
+        dest="insecure",
+        action="store_true",
+        help="Disable TLS certificate verification only when required.",
+    )
+    parser.set_defaults(insecure=True)
     parser.add_argument("--tenant-name", default="", help="Optional tenant sent during login.")
     parser.add_argument(
         "--domain-name",
         default="",
         help="Optional NetBrain domain sent during login. Leave blank unless DDC1 is the actual domain.",
     )
-    parser.add_argument("--site-filter", default=DEFAULT_SITE_FILTER, help="Text used to identify the site. Default: DDC1")
+    parser.add_argument("--site-filter", default=DEFAULT_SITE_FILTER, help="Text used to identify the site. Default: DDC")
     parser.add_argument(
         "--strict-filter",
         action="store_true",
@@ -507,7 +521,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--devices-page-size-param", default="pageSize")
     parser.add_argument("--devices-page-size", type=int, default=DEFAULT_PAGE_SIZE)
     parser.add_argument("--devices-max-pages", type=int, default=DEFAULT_MAX_PAGES)
-    parser.add_argument("--csv-file", default="ddc1_switch_interfaces.csv")
+    parser.add_argument("--csv-file", default="ddc_switch_interfaces.csv")
     parser.add_argument("--raw-json-file", default="netbrain_devices_raw.json")
     return parser
 
@@ -521,6 +535,9 @@ def main() -> int:
     username = input("Username: ").strip()
     password = getpass.getpass("Password: ")
     client = NetBrainClient(args.base_url, insecure=args.insecure)
+
+    print(f"NetBrain URL: {args.base_url}")
+    print(f"TLS certificate verification: {'disabled' if args.insecure else 'enabled'}")
 
     try:
         print("\nLogging into NetBrain...")
