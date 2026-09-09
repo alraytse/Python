@@ -735,14 +735,30 @@ def main() -> int:
 
     if args.collect_interfaces:
         if client is None:
+            fallback_rows = []
+            for row in inventory:
+                subtype = first_value(row, ("subTypeName", "deviceType", "type"), "")
+                raw_name = device_name(row)
+                management = management_ip(row)
+                fallback_rows.append({
+                    "Management IP": management,
+                    "Device Name": raw_name,
+                    "Display Name": management if raw_name in ("", "(none)") else raw_name,
+                    "Device Type": str(subtype),
+                    "Device Category": category(subtype),
+                    "Requested Site": args.site_filter,
+                    "Interface Type": "",
+                    "VRF Name": "",
+                })
             write_dict_csv(
                 Path(args.interfaces_csv_file),
-                [],
+                fallback_rows,
                 INTERFACE_REPORT_FIELDS,
             )
             print(
-                "Offline JSON has no interface records; created a header-only "
-                f"interface CSV: {args.interfaces_csv_file}"
+                "Offline JSON has no interface records; wrote one device row per "
+                f"device with blank interface/VRF fields: {args.interfaces_csv_file} "
+                f"({len(fallback_rows)} rows)"
             )
         else:
             # Reconstruct minimal device dictionaries from the deduplicated rows.
