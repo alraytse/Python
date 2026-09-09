@@ -305,6 +305,18 @@ def interface_name(interface: Dict[str, Any]) -> str:
     ), ""))
 
 
+def vrf_name(interface: Dict[str, Any]) -> str:
+    value = first_value(interface, (
+        "vrfName", "vrf", "vrf_name", "virtualRoutingAndForwarding",
+        "routingInstance", "routingDomain", "forwardingInstance",
+    ), "")
+    if isinstance(value, dict):
+        value = first_value(value, ("name", "vrfName", "value", "id"), "")
+    if isinstance(value, list):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return str(value)
+
+
 def site_values(device: Dict[str, Any]) -> List[str]:
     values = []
     wanted = {re_key(name) for name in (
@@ -568,6 +580,7 @@ def collect_interfaces(
                     row.update({
                         "InterfaceName": interface_name(interface),
                         "InterfaceType": interface_type(interface),
+                        "VRFName": vrf_name(interface),
                         "InterfaceDescription": str(first_value(interface, ("description", "desc", "interfaceDescription"), "")),
                         "AdminStatus": str(first_value(interface, ("adminStatus", "administrativeStatus", "admin_state"), "")),
                         "OperStatus": str(first_value(interface, ("operStatus", "operationalStatus", "status", "linkStatus"), "")),
