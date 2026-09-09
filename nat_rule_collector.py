@@ -23,9 +23,13 @@ import csv
 import getpass
 import re
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
+
+
+DEFAULT_WORKERS = 15
 
 
 REPORT_COLUMNS = [
@@ -381,17 +385,26 @@ def main() -> int:
         return 2
 
     all_rows: List[Dict[str, str]] = []
-    for host in hosts:
-        print(f"Collecting NAT rules from {host}...", file=sys.stderr)
-        try:
-            rows = collect_host(host, username, password, device_type)
-            if rows:
-                all_rows.extend(rows)
-                print(f"  Collected {len(rows)} NAT rule(s).", file=sys.stderr)
-            else:
-                print("  No supported NAT rules found.", file=sys.stderr)
-        except Exception as exc:
-            print(f"  FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
+    worker_count = min(DEFAULT_WORKERS, len(hosts))
+    print(f"Collecting from {len(hosts)} host(s) using {worker_count} worker(s)...", file=sys.stderr)
+
+    with ThreadPoolExecutor(max_workers=worker_count) as executor:
+        future_to_host = {
+            executor.submit(collect_host, host, username, password, device_type): host
+            for host in hosts
+        }
+        for future in as_completed(future_to_host):
+            host = future_to_host[future]
+            print(f"Collecting NAT rules from {host}...", file=sys.stderr)
+            try:
+                rows = future.result()
+                if rows:
+                    all_rows.extend(rows)
+                    print(f"  Collected {len(rows)} NAT rule(s).", file=sys.stderr)
+                else:
+                    print("  No supported NAT rules found.", file=sys.stderr)
+            except Exception as exc:
+                print(f"  FAILED: {type(exc).__name__}: {exc}", file=sys.stderr)
 
     try:
         write_report(output_path, all_rows)
