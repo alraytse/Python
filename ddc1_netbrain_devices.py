@@ -20,7 +20,7 @@ LOGIN_PATH = "/ServicesAPI/API/V1/Session"
 DEVICES_PATH = "/ServicesAPI/API/V1/CMDB/Devices"
 DEFAULT_INTERFACES_PATH = "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/Interfaces"
 DEFAULT_BASE_URL = "https://netbrain.mckesson.com"
-DEFAULT_SITE_FILTER = "DDC"
+DEFAULT_SITE_FILTER = "DDC1"
 DEFAULT_PAGE_SIZE = 50
 DEFAULT_MAX_PAGES = 100
 
@@ -481,6 +481,54 @@ def write_json(value: Any, filename: str) -> None:
     Path(filename).write_text(json.dumps(value, indent=2, default=str), encoding="utf-8")
 
 
+def flatten_json(value: Any, prefix: str = "") -> Dict[str, Any]:
+    """Flatten nested JSON objects into CSV columns; preserve arrays as JSON text."""
+    flattened: Dict[str, Any] = {}
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            column = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(flatten_json(nested, column))
+    elif isinstance(value, list):
+        flattened[prefix] = json.dumps(value, ensure_ascii=False, default=str)
+    else:
+        flattened[prefix] = "" if value is None else value
+    return flattened
+
+
+def write_all_json_columns_csv(raw_responses: Any, filename: str) -> int:
+    """Write every device JSON field to a flattened CSV column."""
+    pages = raw_responses if isinstance(raw_responses, list) else [raw_responses]
+    rows: List[Dict[str, Any]] = []
+
+    for page_number, response in enumerate(pages, start=1):
+        records = extract_records(response, (
+            "devices", "deviceList", "records", "items", "results", "data",
+        ))
+        for record_number, record in enumerate(records, start=1):
+            if isinstance(record, dict):
+                row: Dict[str, Any] = {
+                    "_source_page": page_number,
+                    "_source_record": record_number,
+                }
+                row.update(flatten_json(record))
+                rows.append(row)
+
+    if not rows:
+        return 0
+
+    columns = ["_source_page", "_source_record"]
+    for row in rows:
+        for column in row:
+            if column not in columns:
+                columns.append(column)
+
+    with open(filename, "w", newline="", encoding="utf-8-sig") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=columns, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+    return len(rows)
+
+
 def write_devices_csv(devices: List[Dict[str, Any]], site_filter: str, filename: str) -> None:
     fields = [
         "Name", "ManagementIP", "DeviceType", "DeviceID", "Site",
@@ -555,7 +603,7 @@ def display_interfaces(rows: List[Dict[str, str]]) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Display NetBrain R12 devices and interfaces for site DDC."
+        description="Display NetBrain R12 devices and interfaces for site DDC1."
     )
     parser.add_argument("--base-url", default=DEFAULT_BASE_URL)
     security_group = parser.add_mutually_exclusive_group()
@@ -578,7 +626,7 @@ def build_parser() -> argparse.ArgumentParser:
         default="",
         help="Optional NetBrain domain sent during login. Leave blank unless DDC1 is the actual domain.",
     )
-    parser.add_argument("--site-filter", default=DEFAULT_SITE_FILTER, help="Text used to identify the site. Default: DDC")
+    parser.add_argument("--site-filter", default=DEFAULT_SITE_FILTER, help="Text used to identify the site. Default: DDC1")
     parser.add_argument(
         "--strict-filter",
         action="store_true",
@@ -594,8 +642,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--devices-page-size-param", default="pageSize")
     parser.add_argument("--devices-page-size", type=int, default=DEFAULT_PAGE_SIZE)
     parser.add_argument("--devices-max-pages", type=int, default=DEFAULT_MAX_PAGES)
-    parser.add_argument("--csv-file", default="ddc_switch_interfaces.csv")
+    parser.add_argument("--csv-file", default="ddc1_switch_interfaces.csv")
     parser.add_argument("--raw-json-file", default="netbrain_devices_raw.json")
+    parser.add_argument("--all-columns-csv-file", default="netbrain_devices_all_columns.csv")
     return parser
 
 
@@ -624,6 +673,14 @@ def main() -> int:
             page_size_param=args.devices_page_size_param,
         )
         write_json(raw_responses, args.raw_json_file)
+        all_columns_count = write_all_json_columns_csv(
+            raw_responses,
+            args.all_columns_csv_file,
+        )
+        print(
+            f"All-column CSV saved to: {args.all_columns_csv_file} "
+            f"({all_columns_count} records)"
+        )
 
         matched_devices = [
             device for device in all_devices
