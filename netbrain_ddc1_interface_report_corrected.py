@@ -36,6 +36,18 @@ DEFAULT_SITE_FILTER = "DDC1"
 LOGIN_PATH = "/ServicesAPI/API/V1/Session"
 DEVICES_PATH = "/ServicesAPI/API/V1/CMDB/Devices"
 DEFAULT_INTERFACES_PATH = "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/Interfaces"
+COMMON_INTERFACE_PATHS = (
+    DEFAULT_INTERFACES_PATH,
+    "/ServicesAPI/API/V1/CMDB/Interfaces?deviceId={device_id}",
+    "/ServicesAPI/API/V1/CMDB/Interfaces?deviceID={device_id}",
+    "/ServicesAPI/API/V1/CMDB/Devices/Interfaces?deviceId={device_id}",
+    "/ServicesAPI/API/V1/CMDB/DeviceInterfaces?deviceId={device_id}",
+    "/ServicesAPI/API/V1/CMDB/Interfaces/{device_id}",
+    "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/Interface",
+    "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/interfaces",
+    "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/Ports",
+    "/ServicesAPI/API/V1/CMDB/Ports?deviceId={device_id}",
+)
 INTERFACE_REPORT_FIELDS = [
     "Device ID",
     "Management IP",
@@ -721,13 +733,62 @@ def collect_offline_interfaces(raw_pages: List[Any], site_filter: str) -> List[D
     return rows
 
 
+def format_interface_path(path_template: str, device: Dict[str, Any]) -> str:
+    device_id_value = device_id(device)
+    return path_template.format(
+        device_id=device_id_value,
+        id=device_id_value,
+        name=device_name(device),
+    )
+
+
+def discover_interface_path(
+    client: NetBrainClient,
+    device: Dict[str, Any],
+    configured_path: str,
+) -> str:
+    """Try common R12 interface routes once and return the first usable route."""
+    candidates = [configured_path] + [
+        path for path in COMMON_INTERFACE_PATHS if path != configured_path
+    ]
+    for candidate in candidates:
+        path = format_interface_path(candidate, device)
+        try:
+            response = client.request("GET", path)
+            status_code = first_value(response, ("statusCode", "status", "code"), "")
+            status_description = str(first_value(
+                response, ("statusDescription", "message", "error"), ""
+            )).casefold()
+            if status_code not in ("", 0, 200, "200") and (
+                "no resource" in status_description
+                or "not found" in status_description
+                or "error" in status_description
+            ):
+                print(f"Interface endpoint rejected: {path} ({status_description})")
+                continue
+            print(f"Interface endpoint selected: {path}")
+            return candidate
+        except Exception as error:
+            print(f"Interface endpoint rejected: {path} ({error})")
+    print(
+        "WARNING: No interface endpoint candidate succeeded; continuing with "
+        f"configured path: {configured_path}"
+    )
+    return configured_path
+
+
 def collect_interfaces(
     client: NetBrainClient,
     devices: List[Dict[str, Any]],
     path_template: str,
     site_filter: str,
     workers: int = 30,
+    probe_endpoints: bool = True,
 ) -> List[Dict[str, Any]]:
+    selected_path = path_template
+    if probe_endpoints and devices:
+        selected_path = discover_interface_path(client, devices[0], path_template)
+
     def fetch_one(index: int, device: Dict[str, Any]):
         identity = device_identity(device)
         device_id_value = device_id(device)
@@ -736,11 +797,7 @@ def collect_interfaces(
             return index, interface_rows_for_device(
                 device, [{}], site_filter, "NO_DEVICE_ID", message
             ), message
-        path = path_template.format(
-            device_id=device_id_value,
-            id=device_id_value,
-            name=device_name(device),
-        )
+        path = format_interface_path(selected_path, device)
         try:
             response = client.request("GET", path)
             interfaces = [
@@ -799,6 +856,19 @@ def build_parser() -> argparse.ArgumentParser:
     parser.set_defaults(collect_interfaces=True)
     parser.add_argument("--interfaces-csv-file", default="netbrain_interface_report.csv")
     parser.add_argument("--interfaces-path-template", default=DEFAULT_INTERFACES_PATH)
+    parser.add_argument(
+        "--probe-interface-endpoints",
+        dest="probe_interface_endpoints",
+        action="store_true",
+        help="Probe common interface API routes once before collecting (default).",
+    )
+    parser.add_argument(
+        "--no-probe-interface-endpoints",
+        dest="probe_interface_endpoints",
+        action="store_false",
+        help="Use --interfaces-path-template without probing alternatives.",
+    )
+    parser.set_defaults(probe_interface_endpoints=True)
     parser.add_argument("--page-audit-csv-file", default="", help="Optional pagination audit CSV output.")
     return parser
 
@@ -898,6 +968,7 @@ def main() -> int:
                 args.interfaces_path_template,
                 args.site_filter,
                 args.workers,
+                args.probe_interface_endpoints,
             )
             write_dict_csv(Path(args.interfaces_csv_file), interface_rows, INTERFACE_REPORT_FIELDS)
             print(f"Interface CSV: {args.interfaces_csv_file} ({len(interface_rows)} rows)")
