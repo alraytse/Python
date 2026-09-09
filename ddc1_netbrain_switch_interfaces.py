@@ -1,11 +1,35 @@
 #!/usr/bin/env python3
+"""NetBrain R12 switch/interface/IP report.
+
+Logs in to NetBrain R12, discovers switch devices in a site, retrieves every
+interface returned by the configured interface API, classifies physical and
+virtual/logical interfaces, extracts all IPv4/IPv6 addresses, and writes CSV.
+
+The report is read-only. It does not change NetBrain or network devices.
+
+Dependencies:
+    python -m pip install requests
+
+Example:
+    python ddc1_netbrain_switch_interfaces.py \
+        --base-url https://netbrain.mckesson.com \
+        --site-name DDC1 \
+        --insecure
+"""
+
+from __future__ import annotations
 
 import argparse
 import csv
 import getpass
+import ipaddress
 import json
+import re
 import sys
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import quote
 
 import requests
 import urllib3
@@ -14,772 +38,646 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 LOGIN_PATH = "/ServicesAPI/API/V1/Session"
 DEVICES_PATH = "/ServicesAPI/API/V1/CMDB/Devices"
-DEFAULT_INTERFACES_PATH = (
-    "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/Interfaces"
-)
+DEFAULT_INTERFACES_PATH = "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/Interfaces"
+DEFAULT_BASE_URL = "https://netbrain.mckesson.com"
+DEFAULT_SITE_NAME = "DDC1"
+DEFAULT_CSV_FILE = "ddc1_switch_interfaces.csv"
+DEFAULT_WORKERS = 15
 DEFAULT_PAGE_SIZE = 50
-DEFAULT_MAX_PAGES = 100
+DEFAULT_MAX_PAGES = 200
+DEFAULT_TIMEOUT = 60
+
+DEVICE_ID_KEYS = (
+    "id", "deviceId", "deviceID", "entityId", "entityID", "uuid", "device_id",
+)
+DEVICE_NAME_KEYS = (
+    "name", "deviceName", "hostname", "hostName", "displayName",
+)
+DEVICE_IP_KEYS = (
+    "mgmtIP", "managementIP", "managementIp", "management_ip",
+    "managementAddress", "ipAddress", "ip",
+)
+DEVICE_TYPE_KEYS = (
+    "assetType", "deviceType", "subTypeName", "type", "category", "platform", "role",
+)
+DEVICE_MODEL_KEYS = ("model", "modelName", "platform", "hardwareModel")
+DEVICE_VENDOR_KEYS = ("vendor", "manufacturer", "vendorName")
+DEVICE_SITE_KEYS = ("siteName", "site", "location", "locationName", "containerName", "sitePath")
+INTERFACE_ID_KEYS = ("id", "interfaceId", "interfaceID", "entityId", "entityID", "uuid")
+INTERFACE_NAME_KEYS = (
+    "name", "interfaceName", "ifName", "portName", "interface", "port", "displayName",
+)
+INTERFACE_DESCRIPTION_KEYS = (
+    "description", "interfaceDescription", "alias", "portDescription", "desc",
+)
+INTERFACE_ADMIN_KEYS = (
+    "adminStatus", "administrativeStatus", "admin_state", "adminState",
+)
+INTERFACE_OPER_KEYS = (
+    "operStatus", "operationalStatus", "status", "linkStatus", "state",
+)
+INTERFACE_SPEED_KEYS = ("speed", "bandwidth", "interfaceSpeed", "speedMbps")
+INTERFACE_VLAN_KEYS = ("vlan", "vlanId", "vlanID", "accessVlan", "nativeVlan")
+INTERFACE_TYPE_KEYS = (
+    "interfaceType", "ifType", "type", "category", "kind", "mediaType", "isVirtual",
+)
+
+CSV_FIELDS = [
+    "Device",
+    "Management_IP",
+    "Device_ID",
+    "Vendor",
+    "Model",
+    "Device_Type",
+    "Site",
+    "Interface_ID",
+    "Interface",
+    "Interface_Type",
+    "Description",
+    "Admin_Status",
+    "Operational_Status",
+    "Speed",
+    "VLAN",
+    "All_IP_Addresses",
+    "Collection_Status",
+    "Error",
+]
 
 
 class NetBrainClient:
-    def __init__(self, base_url: str, insecure: bool = False, timeout: int = 60):
-        self.base_url = base_url.rstrip("/")
-        self.timeout = timeout
+    def __init__(self, args: argparse.Namespace, username: str, password: str) -> None:
+        self.base_url = args.base_url.rstrip("/")
+        self.timeout = args.timeout
+        self.login_path = args.login_path
+        self.devices_path = args.devices_path
+        self.interfaces_path_template = args.interfaces_path_template
+        self.devices_method = args.devices_method.upper()
+        self.interfaces_method = args.interfaces_method.upper()
+        self.site_name = args.site_name
+        self.tenant_name = args.tenant_name
+        self.domain_name = args.domain_name
+        self.page_size = args.page_size
+        self.max_pages = args.max_pages
         self.session = requests.Session()
-        self.session.verify = not insecure
-        self.session.headers.update(
-            {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            }
-        )
+        self.session.verify = not args.insecure
+        self.session.headers.update({
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        })
+        self.username = username
+        self.password = password
 
-    def request(self, method: str, path: str, **kwargs: Any) -> Any:
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        params: Optional[Dict[str, Any]] = None,
+        json_body: Optional[Dict[str, Any]] = None,
+    ) -> Any:
         url = path if path.startswith(("http://", "https://")) else self.base_url + path
-        response = self.session.request(
-            method=method,
-            url=url,
-            timeout=self.timeout,
-            **kwargs,
-        )
+        try:
+            response = self.session.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json_body,
+                timeout=self.timeout,
+            )
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Request failed for {method} {url}: {exc}") from exc
 
         if not response.ok:
-            body = response.text[:1000].replace("\n", " ")
-            raise RuntimeError(
-                f"HTTP {response.status_code} from {url}: {body}"
-            )
+            detail = response.text[:1000].replace("\n", " ").replace("\r", " ")
+            raise RuntimeError(f"HTTP {response.status_code} from {method} {url}: {detail}")
 
-        if not response.text.strip():
+        if not response.content:
             return {}
 
-        content_type = response.headers.get("Content-Type", "")
         try:
             return response.json()
-        except ValueError as error:
-            body = response.text[:1000].replace("\n", " ")
-            if "html" in content_type.lower() or body.lstrip().startswith("<"):
+        except ValueError as exc:
+            detail = response.text[:1000].replace("\n", " ").replace("\r", " ")
+            if "html" in response.headers.get("Content-Type", "").lower() or detail.lstrip().startswith("<"):
                 raise RuntimeError(
                     f"NetBrain returned HTML instead of JSON from {url}. "
-                    "Verify the R12 Web API hostname, protocol, and path."
-                ) from error
-            raise RuntimeError(
-                f"Non-JSON response from {url}: {body}"
-            ) from error
+                    "Verify the R12 application-server URL, protocol, and API path."
+                ) from exc
+            raise RuntimeError(f"Non-JSON response from {url}: {detail}") from exc
 
-    def login(
-        self,
-        username: str,
-        password: str,
-        tenant_name: str = "",
-        domain_name: str = "",
-    ) -> None:
-        payload = {
-            "username": username,
-            "password": password,
+    def login(self) -> None:
+        payload: Dict[str, Any] = {
+            "username": self.username,
+            "password": self.password,
         }
-        if tenant_name:
-            payload["tenantName"] = tenant_name
-        if domain_name:
-            payload["domainName"] = domain_name
+        if self.tenant_name:
+            payload["tenantName"] = self.tenant_name
+        if self.domain_name:
+            payload["domainName"] = self.domain_name
 
-        response = self.request("POST", LOGIN_PATH, json=payload)
-        token = first_value(
-            response,
-            (
-                "token",
-                "Token",
-                "accessToken",
-                "access_token",
-                "data.token",
-                "data.accessToken",
-                "result.token",
-                "result.accessToken",
-            ),
-        )
-
+        response = self.request("POST", self.login_path, json_body=payload)
+        token = find_token(response)
         if not token:
             raise RuntimeError(
-                "Login succeeded but no token was found in the response:\n"
+                "Login returned no session token. Response: "
                 + json.dumps(response, indent=2, default=str)[:3000]
             )
 
-        self.session.headers.update(
-            {
-                "Token": str(token),
-                "Authorization": f"Bearer {token}",
+        self.session.headers.update({
+            "Token": token,
+            "Authorization": f"Bearer {token}",
+        })
+
+    def get_devices(self) -> List[Dict[str, Any]]:
+        all_records: List[Dict[str, Any]] = []
+        previous_signature: Optional[Tuple[str, ...]] = None
+
+        for page in range(1, self.max_pages + 1):
+            query = {
+                "siteName": self.site_name,
+                "assetType": "Switch",
+                "page": page,
+                "pageNo": page,
+                "pageSize": self.page_size,
+                "limit": self.page_size,
             }
+            body = dict(query)
+            response = self.request(
+                self.devices_method,
+                self.devices_path,
+                params=query if self.devices_method == "GET" else None,
+                json_body=body if self.devices_method != "GET" else None,
+            )
+            records = find_records(response, ("devices", "items", "records", "results"))
+            if not records:
+                break
+
+            signature = tuple(
+                first_value(record, DEVICE_ID_KEYS + DEVICE_NAME_KEYS + DEVICE_IP_KEYS, "")
+                for record in records
+            )
+            if signature == previous_signature:
+                break
+            previous_signature = signature
+            all_records.extend(records)
+
+            has_more = find_bool(response, ("hasMore", "hasNext", "more"))
+            next_page = first_value(response, ("nextPage", "nextPageNo", "pageNext"), "")
+            if str(next_page).isdigit():
+                next_page_number = int(next_page)
+                if next_page_number <= page:
+                    break
+            elif has_more is False:
+                break
+            elif has_more is None and len(records) < self.page_size:
+                break
+
+            if len(records) < self.page_size and has_more is not True and not str(next_page).isdigit():
+                break
+
+        normalized = [normalize_device(record) for record in all_records]
+        return deduplicate_devices(normalized)
+
+    def get_interfaces(self, device: Dict[str, Any]) -> List[Dict[str, Any]]:
+        path = build_path(self.interfaces_path_template, device)
+        query = {
+            "deviceId": device["id"],
+            "deviceName": device["name"],
+            "managementIP": device["management_ip"],
+        }
+        response = self.request(
+            self.interfaces_method,
+            path,
+            params=query if self.interfaces_method == "GET" else None,
+            json_body=query if self.interfaces_method != "GET" else None,
         )
-        print("Successfully authenticated")
-
-    def get_devices(
-        self,
-        page_size: int = DEFAULT_PAGE_SIZE,
-        max_pages: int = DEFAULT_MAX_PAGES,
-        page_param: str = "pageNo",
-        page_size_param: str = "pageSize",
-    ) -> List[Dict[str, Any]]:
-        """Retrieve devices, following API pagination when available.
-
-        The first request intentionally has no query parameters so it remains
-        compatible with the working API call. If NetBrain returns pagination
-        metadata, the next URL/token is followed. If metadata is absent and
-        the page is full, a pageNo/pageSize request is attempted and duplicate
-        records are detected to prevent an infinite loop.
-        """
-        all_devices: List[Dict[str, Any]] = []
-        seen_devices: Set[Tuple[str, str, str]] = set()
-        response = self.request("GET", DEVICES_PATH)
-        page_number = 1
-
-        for _ in range(max_pages):
-            records = extract_records(
-                response,
-                ("devices", "data", "items", "results"),
-            )
-            page_devices = [
-                item for item in records if isinstance(item, dict)
-            ]
-
-            new_count = 0
-            for device in page_devices:
-                key = device_key(device)
-                if key not in seen_devices:
-                    seen_devices.add(key)
-                    all_devices.append(device)
-                    new_count += 1
-
-            print(
-                f"Retrieved device page {page_number}: "
-                f"{len(page_devices)} records ({new_count} new)"
-            )
-
-            # Some deployments ignore unknown page parameters and return the
-            # first page repeatedly. Stop as soon as a later page adds no new
-            # unique devices.
-            if page_number > 1 and new_count == 0:
-                print(
-                    "Pagination returned no new unique devices; "
-                    "stopping safely."
-                )
-                break
-
-            next_url = find_first_key(
-                response,
-                {
-                    "next",
-                    "nexturl",
-                    "nextpageurl",
-                    "nextpageurl",
-                    "nextlink",
-                },
-            )
-            next_token = find_first_key(
-                response,
-                {
-                    "nexttoken",
-                    "nextpagetoken",
-                    "continuationtoken",
-                    "continuation_token",
-                    "cursor",
-                },
-            )
-            has_more = find_boolean_key(
-                response,
-                {"hasmore", "has_more", "ismore", "moreavailable"},
-            )
-
-            total = find_number_key(
-                response,
-                {"total", "totalcount", "total_count", "recordcount"},
-            )
-            if (
-                has_more is None
-                and total is not None
-                and len(all_devices) < total
-            ):
-                has_more = True
-
-            if next_url:
-                response = self.request("GET", str(next_url))
-                page_number += 1
-                continue
-
-            if next_token:
-                response = self.request(
-                    "GET",
-                    DEVICES_PATH,
-                    params={"pageToken": str(next_token)},
-                )
-                page_number += 1
-                continue
-
-            should_request_next_page = (
-                has_more is True
-                or (has_more is None and len(page_devices) >= page_size)
-            )
-            if not should_request_next_page:
-                break
-
-            page_number += 1
-            try:
-                response = self.request(
-                    "GET",
-                    DEVICES_PATH,
-                    params={
-                        page_param: page_number,
-                        page_size_param: page_size,
-                    },
-                )
-            except Exception as error:
-                print(
-                    f"Pagination request failed on page {page_number}: {error}"
-                )
-                break
-
-            # If the server ignored the pagination parameters, the next page
-            # will contain no new devices and the loop will stop safely.
-            if page_number > 1 and not page_devices:
-                break
-
-        else:
-            print(f"Stopped after --devices-max-pages {max_pages}")
-
-        return all_devices
-
-    def get_interfaces(
-        self,
-        device: Dict[str, Any],
-        path_template: str,
-        method: str = "GET",
-    ) -> List[Dict[str, Any]]:
-        device_id = first_value(
-            device,
-            ("id", "deviceId", "deviceID", "device_id", "uuid"),
-        )
-        if device_id is None:
-            raise RuntimeError("Device has no ID: " + json.dumps(device)[:500])
-
-        path = path_template.format(
-            device_id=str(device_id),
-            id=str(device_id),
-            name=str(first_value(device, ("name", "hostName", "hostname"), "")),
-        )
-        response = self.request(method.upper(), path)
-        interfaces = extract_records(
+        records = find_records(
             response,
-            ("interfaces", "ports", "data", "items", "results"),
+            ("interfaces", "ports", "interfaceList", "items", "records", "results"),
         )
-        return [item for item in interfaces if isinstance(item, dict)]
+        return [record for record in records if isinstance(record, dict)]
 
 
-def first_value(
-    obj: Any,
-    paths: Iterable[str],
-    default: Any = None,
-) -> Any:
-    for path in paths:
-        value = obj
-        found = True
-        for part in path.split("."):
-            if not isinstance(value, dict) or part not in value:
-                found = False
-                break
-            value = value[part]
-        if found and value not in (None, ""):
+def normalize_key(value: Any) -> str:
+    return re.sub(r"[^a-z0-9]", "", str(value).lower())
+
+
+def clean(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, sort_keys=True, default=str)
+    return str(value).strip()
+
+
+def first_value(record: Any, keys: Sequence[str], default: Any = "") -> Any:
+    if not isinstance(record, dict):
+        return default
+    normalized = {normalize_key(key): value for key, value in record.items()}
+    for key in keys:
+        value = normalized.get(normalize_key(key))
+        if value not in (None, "", []):
             return value
     return default
 
 
-def extract_records(response: Any, preferred_keys: Iterable[str]) -> List[Any]:
-    if isinstance(response, list):
-        return response
-    if not isinstance(response, dict):
+def find_records(payload: Any, preferred_keys: Iterable[str]) -> List[Dict[str, Any]]:
+    if isinstance(payload, list):
+        return [item for item in payload if isinstance(item, dict)]
+    if not isinstance(payload, dict):
         return []
 
-    for key in preferred_keys:
-        value = response.get(key)
-        if isinstance(value, list):
-            return value
-        if isinstance(value, dict):
-            nested = extract_records(value, preferred_keys)
-            if nested:
-                return nested
+    preferred = {normalize_key(key) for key in preferred_keys}
+    for key, value in payload.items():
+        if normalize_key(key) in preferred and isinstance(value, list):
+            return [item for item in value if isinstance(item, dict)]
 
-    for key in ("result", "response", "payload"):
-        value = response.get(key)
+    for key in ("data", "result", "response", "payload", "content"):
+        value = payload.get(key)
         if isinstance(value, (dict, list)):
-            nested = extract_records(value, preferred_keys)
-            if nested:
-                return nested
+            records = find_records(value, preferred_keys)
+            if records:
+                return records
 
-    if response and all(isinstance(value, dict) for value in response.values()):
-        return list(response.values())
+    for key, value in payload.items():
+        if isinstance(value, dict):
+            records = find_records(value, preferred_keys)
+            if records:
+                return records
 
+    if payload and any(
+        first_value(payload, keys, "")
+        for keys in (DEVICE_NAME_KEYS, DEVICE_ID_KEYS, INTERFACE_NAME_KEYS)
+    ):
+        return [payload]
     return []
 
 
-def find_first_key(obj: Any, wanted_keys: Set[str]) -> Optional[Any]:
-    """Find the first value for one of the keys at any response nesting level."""
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            normalized = re_key(key)
-            if normalized in wanted_keys and value not in (None, "", False):
-                if isinstance(value, (str, int, float)):
-                    return value
-            found = find_first_key(value, wanted_keys)
-            if found not in (None, ""):
-                return found
-    elif isinstance(obj, list):
-        for value in obj:
-            found = find_first_key(value, wanted_keys)
-            if found not in (None, ""):
-                return found
-    return None
+def find_token(payload: Any) -> str:
+    if isinstance(payload, dict):
+        for key in ("token", "Token", "accessToken", "access_token", "sessionToken", "jwt"):
+            value = payload.get(key)
+            if value:
+                return clean(value)
+        for value in payload.values():
+            token = find_token(value)
+            if token:
+                return token
+    elif isinstance(payload, list):
+        for value in payload:
+            token = find_token(value)
+            if token:
+                return token
+    return ""
 
 
-def find_boolean_key(obj: Any, wanted_keys: Set[str]) -> Optional[bool]:
-    if isinstance(obj, dict):
-        for key, value in obj.items():
-            if re_key(key) in wanted_keys and isinstance(value, bool):
+def find_bool(payload: Any, keys: Sequence[str]) -> Optional[bool]:
+    if isinstance(payload, dict):
+        normalized = {normalize_key(key): value for key, value in payload.items()}
+        for key in keys:
+            value = normalized.get(normalize_key(key))
+            if isinstance(value, bool):
                 return value
-            found = find_boolean_key(value, wanted_keys)
-            if found is not None:
-                return found
-    elif isinstance(obj, list):
-        for value in obj:
-            found = find_boolean_key(value, wanted_keys)
-            if found is not None:
-                return found
+            if isinstance(value, str) and value.lower() in {"true", "false"}:
+                return value.lower() == "true"
+        for value in payload.values():
+            result = find_bool(value, keys)
+            if result is not None:
+                return result
+    elif isinstance(payload, list):
+        for value in payload:
+            result = find_bool(value, keys)
+            if result is not None:
+                return result
     return None
 
 
-def find_number_key(obj: Any, wanted_keys: Set[str]) -> Optional[int]:
-    value = find_first_key(obj, wanted_keys)
-    if isinstance(value, bool):
-        return None
+def build_path(template: str, device: Dict[str, str]) -> str:
+    replacements = {
+        "device_id": quote(device["id"], safe=""),
+        "id": quote(device["id"], safe=""),
+        "device_name": quote(device["name"], safe=""),
+        "name": quote(device["name"], safe=""),
+        "management_ip": quote(device["management_ip"], safe=""),
+    }
     try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
+        return template.format(**replacements)
+    except KeyError as exc:
+        raise ValueError(
+            f"Unsupported interface path placeholder {{{exc.args[0]}}}. "
+            "Use {device_id}, {id}, {device_name}, {name}, or {management_ip}."
+        ) from exc
 
 
-def re_key(value: Any) -> str:
-    return "".join(character.lower() for character in str(value) if character.isalnum())
-
-
-def flatten_strings(value: Any) -> Iterable[str]:
-    if isinstance(value, dict):
-        for nested_value in value.values():
-            yield from flatten_strings(nested_value)
-    elif isinstance(value, list):
-        for nested_value in value:
-            yield from flatten_strings(nested_value)
-    elif value not in (None, ""):
-        yield str(value)
-
-
-def text_from(device: Dict[str, Any], names: Iterable[str]) -> str:
-    values = []
-    wanted = {re_key(name) for name in names}
-
-    def collect(obj: Any) -> None:
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if re_key(key) in wanted:
-                    values.extend(flatten_strings(value))
-                collect(value)
-        elif isinstance(obj, list):
-            for value in obj:
-                collect(value)
-
-    collect(device)
-    return " ".join(values)
-
-
-def is_ddc1_device(device: Dict[str, Any]) -> bool:
-    # Search every nested value because the site may be under a nested
-    # location/site object rather than a top-level siteName field.
-    return "DDC1" in " ".join(flatten_strings(device)).upper()
-
-
-def is_switch(device: Dict[str, Any]) -> bool:
-    values = " ".join(flatten_strings(device)).lower()
-    switch_terms = (
-        "switch",
-        "catalyst",
-        "nexus",
-        "n9k",
-        "n3k",
-        "n5k",
-        "n7k",
-        "arista",
-        "eos",
-        "nx-os",
-        "nxos",
-        "ios-xe",
-        "leaf",
-        "spine",
-    )
-    router_terms = (
-        "router",
-        "firewall",
-        "load balancer",
-        "wireless controller",
-    )
-
-    if any(term in values for term in router_terms) and "switch" not in values:
-        return False
-    return any(term in values for term in switch_terms)
-
-
-def device_key(device: Dict[str, Any]) -> Tuple[str, str, str]:
-    device_id = first_value(
-        device,
-        ("id", "deviceId", "deviceID", "device_id", "uuid"),
-        "",
-    )
-    name = first_value(device, ("name", "deviceName", "hostName", "hostname"), "")
-    ip = first_value(
-        device,
-        (
-            "mgmtIP",
-            "managementIp",
-            "managementIP",
-            "management_ip",
-            "ip",
-            "ipAddress",
-        ),
-        "",
-    )
-    return str(device_id), str(name).lower(), str(ip).lower()
-
-
-def management_ip(device: Dict[str, Any]) -> str:
-    return str(
-        first_value(
-            device,
-            (
-                "mgmtIP",
-                "managementIp",
-                "managementIP",
-                "management_ip",
-                "ip",
-                "ipAddress",
-            ),
-            "",
-        )
-    )
-
-
-def interface_value(interface: Dict[str, Any], names: Iterable[str]) -> str:
-    value = first_value(interface, names, "")
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, separators=(",", ":"), default=str)
-    return str(value)
-
-
-def normalize_interface_row(
-    device: Dict[str, Any], interface: Dict[str, Any]
-) -> Dict[str, str]:
+def normalize_device(record: Dict[str, Any]) -> Dict[str, str]:
     return {
-        "Device": str(first_value(device, ("name", "hostName", "hostname"), "")),
-        "ManagementIP": management_ip(device),
-        "DeviceType": str(
-            first_value(device, ("subTypeName", "deviceType", "type"), "")
-        ),
-        "DeviceID": str(
-            first_value(device, ("id", "deviceId", "deviceID", "uuid"), "")
-        ),
-        "Interface": interface_value(
-            interface,
-            (
-                "name",
-                "interfaceName",
-                "ifName",
-                "portName",
-                "port",
-                "displayName",
-            ),
-        ),
-        "Description": interface_value(
-            interface,
-            ("description", "desc", "interfaceDescription"),
-        ),
-        "AdminStatus": interface_value(
-            interface,
-            ("adminStatus", "administrativeStatus", "admin_state"),
-        ),
-        "OperStatus": interface_value(
-            interface,
-            ("operStatus", "operationalStatus", "status", "linkStatus"),
-        ),
-        "Speed": interface_value(
-            interface,
-            ("speed", "bandwidth", "interfaceSpeed", "speedMbps"),
-        ),
-        "VLAN": interface_value(
-            interface,
-            ("vlan", "vlanId", "vlanID", "accessVlan", "nativeVlan"),
-        ),
-        "IPAddress": interface_value(
-            interface,
-            ("ipAddress", "ip", "ipv4Address", "ipv6Address"),
-        ),
+        "id": clean(first_value(record, DEVICE_ID_KEYS)),
+        "name": clean(first_value(record, DEVICE_NAME_KEYS)),
+        "management_ip": clean(first_value(record, DEVICE_IP_KEYS)),
+        "vendor": clean(first_value(record, DEVICE_VENDOR_KEYS)),
+        "model": clean(first_value(record, DEVICE_MODEL_KEYS)),
+        "device_type": clean(first_value(record, DEVICE_TYPE_KEYS)),
+        "site": clean(first_value(record, DEVICE_SITE_KEYS)),
+        "raw": record,
     }
 
 
-def write_csv(rows: List[Dict[str, str]], filename: str) -> None:
-    fields = [
-        "Device",
-        "ManagementIP",
-        "DeviceType",
-        "DeviceID",
-        "Interface",
-        "Description",
-        "AdminStatus",
-        "OperStatus",
-        "Speed",
-        "VLAN",
-        "IPAddress",
-    ]
-    with open(filename, "w", newline="", encoding="utf-8") as csv_file:
-        writer = csv.DictWriter(csv_file, fieldnames=fields)
+def deduplicate_devices(devices: Iterable[Dict[str, str]]) -> List[Dict[str, str]]:
+    unique: Dict[str, Dict[str, str]] = {}
+    for device in devices:
+        key = (device["id"] or device["management_ip"] or device["name"]).lower()
+        if key and key not in unique:
+            unique[key] = device
+    return list(unique.values())
+
+
+def device_matches_site(device: Dict[str, str], site_name: str) -> bool:
+    if not site_name or site_name.lower() in {"*", "all"}:
+        return True
+    site_text = device.get("site", "")
+    if not site_text:
+        # The API request already included siteName; do not discard records
+        # when the response omits the site field.
+        return True
+    return site_name.lower() in site_text.lower()
+
+
+def device_is_switch(device: Dict[str, str]) -> bool:
+    text = " ".join(
+        device.get(field, "")
+        for field in ("device_type", "vendor", "model", "name")
+    ).lower()
+    if any(term in text for term in ("router", "firewall", "load balancer", "wireless controller")):
+        return "switch" in text
+    return True
+
+
+def extract_ip_tokens(text: str) -> List[str]:
+    candidates = re.findall(r"(?<![A-Za-z0-9])[0-9A-Fa-f:.]+(?:/\d{1,3})?(?![A-Za-z0-9])", text)
+    found: List[str] = []
+    for candidate in candidates:
+        candidate = candidate.strip(".,;()[]{}<>")
+        try:
+            value = ipaddress.ip_interface(candidate) if "/" in candidate else ipaddress.ip_address(candidate)
+        except ValueError:
+            continue
+        normalized = str(value)
+        if normalized not in found:
+            found.append(normalized)
+    return found
+
+
+def collect_all_ips(value: Any) -> List[str]:
+    found: List[str] = []
+
+    def visit(item: Any) -> None:
+        if isinstance(item, dict):
+            for child in item.values():
+                visit(child)
+        elif isinstance(item, list):
+            for child in item:
+                visit(child)
+        elif item is not None:
+            for address in extract_ip_tokens(str(item)):
+                if address not in found:
+                    found.append(address)
+
+    visit(value)
+    return found
+
+
+def classify_interface(interface: Dict[str, Any], name: str) -> str:
+    explicit = clean(first_value(interface, INTERFACE_TYPE_KEYS)).lower()
+    if explicit in {"true", "yes", "1"}:
+        return "Virtual"
+    if explicit in {"false", "no", "0"}:
+        return "Physical"
+    if explicit:
+        if any(term in explicit for term in ("physical", "ethernet", "fiber", "copper")):
+            return "Physical"
+        if any(term in explicit for term in ("virtual", "logical", "svi", "loopback", "tunnel")):
+            return "Virtual"
+
+    normalized = name.lower().replace(" ", "")
+    if normalized.startswith((
+        "ethernet", "eth", "gigabitethernet", "gi", "tengigabitethernet",
+        "te", "fortygigabitethernet", "fo", "hundredgigabitethernet", "hu",
+        "fastethernet", "fa", "fiberchannel", "fc",
+    )):
+        return "Physical"
+    if normalized.startswith((
+        "vlan", "svi", "loopback", "lo", "tunnel", "tun", "bdi", "nve",
+        "irb", "bridge", "management", "mgmt",
+    )):
+        return "Virtual"
+    if normalized.startswith(("port-channel", "portchannel", "po", "bundle", "ae")):
+        return "Logical"
+    return "Unknown"
+
+
+def normalize_interface(interface: Dict[str, Any]) -> Dict[str, str]:
+    name = clean(first_value(interface, INTERFACE_NAME_KEYS))
+    return {
+        "id": clean(first_value(interface, INTERFACE_ID_KEYS)),
+        "name": name,
+        "interface_type": classify_interface(interface, name),
+        "description": clean(first_value(interface, INTERFACE_DESCRIPTION_KEYS)),
+        "admin_status": clean(first_value(interface, INTERFACE_ADMIN_KEYS)),
+        "oper_status": clean(first_value(interface, INTERFACE_OPER_KEYS)),
+        "speed": clean(first_value(interface, INTERFACE_SPEED_KEYS)),
+        "vlan": clean(first_value(interface, INTERFACE_VLAN_KEYS)),
+        "all_ips": "; ".join(collect_all_ips(interface)),
+    }
+
+
+def collect_device(
+    client: NetBrainClient,
+    device: Dict[str, str],
+) -> Dict[str, Any]:
+    try:
+        raw_interfaces = client.get_interfaces(device)
+        interfaces = [normalize_interface(interface) for interface in raw_interfaces]
+        return {"device": device, "interfaces": interfaces, "error": ""}
+    except Exception as exc:
+        return {"device": device, "interfaces": [], "error": str(exc)}
+
+
+def flatten_results(results: Iterable[Dict[str, Any]]) -> List[Dict[str, str]]:
+    rows: List[Dict[str, str]] = []
+    for result in results:
+        device = result["device"]
+        base = {
+            "Device": device["name"],
+            "Management_IP": device["management_ip"],
+            "Device_ID": device["id"],
+            "Vendor": device["vendor"],
+            "Model": device["model"],
+            "Device_Type": device["device_type"],
+            "Site": device["site"],
+        }
+        if result["error"]:
+            rows.append({
+                **base,
+                "Interface_ID": "",
+                "Interface": "",
+                "Interface_Type": "",
+                "Description": "",
+                "Admin_Status": "",
+                "Operational_Status": "",
+                "Speed": "",
+                "VLAN": "",
+                "All_IP_Addresses": "",
+                "Collection_Status": "FAILED",
+                "Error": result["error"],
+            })
+            continue
+
+        if not result["interfaces"]:
+            rows.append({
+                **base,
+                "Interface_ID": "",
+                "Interface": "",
+                "Interface_Type": "",
+                "Description": "",
+                "Admin_Status": "",
+                "Operational_Status": "",
+                "Speed": "",
+                "VLAN": "",
+                "All_IP_Addresses": "",
+                "Collection_Status": "NO_INTERFACES_RETURNED",
+                "Error": "",
+            })
+            continue
+
+        for interface in result["interfaces"]:
+            rows.append({
+                **base,
+                "Interface_ID": interface["id"],
+                "Interface": interface["name"],
+                "Interface_Type": interface["interface_type"],
+                "Description": interface["description"],
+                "Admin_Status": interface["admin_status"],
+                "Operational_Status": interface["oper_status"],
+                "Speed": interface["speed"],
+                "VLAN": interface["vlan"],
+                "All_IP_Addresses": interface["all_ips"],
+                "Collection_Status": "SUCCESS",
+                "Error": "",
+            })
+    return rows
+
+
+def write_csv(rows: Iterable[Dict[str, str]], path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=CSV_FIELDS)
         writer.writeheader()
         writer.writerows(rows)
 
 
-def display_rows(rows: List[Dict[str, str]]) -> None:
-    headers = [
-        ("Device", 38),
-        ("ManagementIP", 16),
-        ("Interface", 24),
-        ("AdminStatus", 14),
-        ("OperStatus", 14),
-        ("Speed", 14),
-        ("VLAN", 10),
-        ("Description", 42),
-    ]
-    print("\n" + "=" * 180)
-    print("DDC1 SWITCH INTERFACES")
-    print("=" * 180)
-    print("".join(f"{name:<{width}}" for name, width in headers))
-    print("-" * 180)
+def display_summary(rows: List[Dict[str, str]], device_count: int) -> None:
+    successful = [row for row in rows if row["Collection_Status"] == "SUCCESS"]
+    physical = sum(row["Interface_Type"] == "Physical" for row in successful)
+    virtual = sum(row["Interface_Type"] == "Virtual" for row in successful)
+    logical = sum(row["Interface_Type"] == "Logical" for row in successful)
+    ip_rows = sum(bool(row["All_IP_Addresses"]) for row in successful)
+    failed = sum(row["Collection_Status"] == "FAILED" for row in rows)
 
-    for row in rows:
-        print(
-            "".join(
-                f"{row.get(name, '')[:width - 1]:<{width}}"
-                for name, width in headers
-            )
-        )
-
-
-def display_device_diagnostics(all_devices: List[Dict[str, Any]]) -> None:
-    """Print enough schema information to identify NetBrain field names."""
-    print("\nDEVICE FILTER DIAGNOSTIC")
-    print("No DDC1 devices matched the returned records.")
-    print(f"Records inspected: {len(all_devices)}")
-
-    if not all_devices:
-        print("No device schema was returned by the API.")
-        return
-
-    sample = all_devices[0]
-    print("\nFirst device JSON sample:")
-    print(json.dumps(sample, indent=2, default=str)[:10000])
-
-    top_level_fields = sorted(str(key) for key in sample.keys())
-    print("\nFirst device top-level fields:")
-    print(", ".join(top_level_fields))
-
-    print("\nFirst device nested field paths:")
-    paths: List[str] = []
-
-    def collect_paths(value: Any, prefix: str = "") -> None:
-        if isinstance(value, dict):
-            for key, nested_value in value.items():
-                path = f"{prefix}.{key}" if prefix else str(key)
-                paths.append(path)
-                collect_paths(nested_value, path)
-        elif isinstance(value, list) and value:
-            collect_paths(value[0], f"{prefix}[]")
-
-    collect_paths(sample)
-    print(", ".join(paths[:300]))
-
-    print("\nReturned device names/sites/types:")
-    for device in all_devices[:20]:
-        name = first_value(
-            device,
-            ("name", "deviceName", "hostName", "hostname"),
-            "",
-        )
-        site = text_from(
-            device,
-            ("siteName", "site", "sitePath", "location", "locationName"),
-        )
-        device_type = text_from(
-            device,
-            (
-                "subTypeName",
-                "deviceType",
-                "type",
-                "deviceClass",
-                "category",
-                "platform",
-            ),
-        )
-        print(f"  name={name!r}, site={site!r}, type={device_type!r}")
+    print("\n" + "=" * 100)
+    print("NETBRAIN SWITCH / INTERFACE / IP REPORT")
+    print("=" * 100)
+    print(f"Switches discovered       : {device_count}")
+    print(f"Interface rows returned   : {len(successful)}")
+    print(f"Physical interfaces       : {physical}")
+    print(f"Virtual interfaces        : {virtual}")
+    print(f"Logical interfaces        : {logical}")
+    print(f"Interfaces with IP data   : {ip_rows}")
+    print(f"Device collection failures: {failed}")
+    print("=" * 100)
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description=(
-            "Display all switch interfaces in DDC1 using the NetBrain R12 REST API."
-        )
+        description="Report all NetBrain R12 switch interfaces and interface IP addresses."
     )
-    parser.add_argument(
-        "--base-url",
-        default="https://netbrain.mckesson.com",
-        help="NetBrain R12 Application Server URL.",
-    )
-    parser.add_argument(
-        "--insecure",
-        action="store_true",
-        help="Disable TLS certificate verification.",
-    )
-    parser.add_argument(
-        "--tenant-name",
-        default="",
-        help="Optional NetBrain tenant name sent during login.",
-    )
-    parser.add_argument(
-        "--domain-name",
-        default="",
-        help="Optional NetBrain domain name sent during login.",
-    )
+    parser.add_argument("--base-url", default=DEFAULT_BASE_URL, help="NetBrain application-server URL.")
+    parser.add_argument("--site-name", default=DEFAULT_SITE_NAME, help="Site filter. Use all to query all sites.")
+    parser.add_argument("--tenant-name", default="", help="Optional tenant name for login.")
+    parser.add_argument("--domain-name", default="", help="Optional domain name for login.")
+    parser.add_argument("--login-path", default=LOGIN_PATH, help=f"Login API path. Default: {LOGIN_PATH}")
+    parser.add_argument("--devices-path", default=DEVICES_PATH, help=f"Device API path. Default: {DEVICES_PATH}")
     parser.add_argument(
         "--interfaces-path-template",
         default=DEFAULT_INTERFACES_PATH,
         help=(
-            "Interface endpoint path template. Supported placeholders: "
-            "{device_id}, {id}, and {name}."
+            "Interface API path template. Supported placeholders: "
+            "{device_id}, {id}, {device_name}, {name}, {management_ip}."
         ),
     )
-    parser.add_argument(
-        "--interfaces-method",
-        choices=("GET", "POST"),
-        default="GET",
-        help="HTTP method for the interface endpoint. Default: GET.",
-    )
-    parser.add_argument(
-        "--devices-page-param",
-        default="pageNo",
-        help="Page-number query parameter used when metadata is absent.",
-    )
-    parser.add_argument(
-        "--devices-page-size-param",
-        default="pageSize",
-        help="Page-size query parameter used when metadata is absent.",
-    )
-    parser.add_argument(
-        "--devices-page-size",
-        type=int,
-        default=DEFAULT_PAGE_SIZE,
-        help=f"Expected page size for pagination. Default: {DEFAULT_PAGE_SIZE}.",
-    )
-    parser.add_argument(
-        "--devices-max-pages",
-        type=int,
-        default=DEFAULT_MAX_PAGES,
-        help=f"Maximum device pages to retrieve. Default: {DEFAULT_MAX_PAGES}.",
-    )
-    parser.add_argument(
-        "--csv-file",
-        default="ddc1_switch_interfaces.csv",
-        help="CSV output filename.",
-    )
+    parser.add_argument("--devices-method", choices=("GET", "POST"), default="GET")
+    parser.add_argument("--interfaces-method", choices=("GET", "POST"), default="GET")
+    parser.add_argument("--csv-file", type=Path, default=Path(DEFAULT_CSV_FILE))
+    parser.add_argument("--workers", type=int, default=DEFAULT_WORKERS, help=f"Parallel interface workers. Default: {DEFAULT_WORKERS}")
+    parser.add_argument("--page-size", type=int, default=DEFAULT_PAGE_SIZE)
+    parser.add_argument("--max-pages", type=int, default=DEFAULT_MAX_PAGES)
+    parser.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
+    parser.add_argument("--insecure", action="store_true", help="Disable TLS certificate verification.")
     return parser
 
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.devices_page_size <= 0 or args.devices_max_pages <= 0:
-        print(
-            "Error: --devices-page-size and --devices-max-pages must be positive.",
-            file=sys.stderr,
-        )
+    if args.workers < 1 or args.page_size < 1 or args.max_pages < 1 or args.timeout < 1:
+        print("workers, page-size, max-pages, and timeout must be positive.", file=sys.stderr)
         return 2
 
-    username = input("Username: ").strip()
-    password = getpass.getpass("Password: ")
-    client = NetBrainClient(args.base_url, insecure=args.insecure)
+    username = input("NetBrain username: ").strip()
+    password = getpass.getpass("NetBrain password: ")
+    if not username or not password:
+        print("Username and password are required.", file=sys.stderr)
+        return 2
 
+    client = NetBrainClient(args, username, password)
     try:
-        print("\nLogging into NetBrain...")
-        client.login(
-            username,
-            password,
-            tenant_name=args.tenant_name,
-            domain_name=args.domain_name,
-        )
+        print("Logging in to NetBrain...")
+        client.login()
+        print(f"Retrieving switch devices for site {args.site_name}...")
+        devices = [
+            device for device in client.get_devices()
+            if device_matches_site(device, args.site_name) and device_is_switch(device)
+        ]
+        if not devices:
+            print("No switch devices were returned. Verify site, API paths, and permissions.", file=sys.stderr)
+            return 1
 
-        print("\nRetrieving devices...")
-        all_devices = client.get_devices(
-            page_size=args.devices_page_size,
-            max_pages=args.devices_max_pages,
-            page_param=args.devices_page_param,
-            page_size_param=args.devices_page_size_param,
-        )
+        worker_count = min(args.workers, len(devices))
+        print(f"Found {len(devices)} switch device(s); using {worker_count} worker(s).")
+        results: List[Dict[str, Any]] = []
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = {
+                executor.submit(collect_device, client, device): device
+                for device in devices
+            }
+            for future in as_completed(futures):
+                result = future.result()
+                results.append(result)
+                device = result["device"]
+                label = device["name"] or device["management_ip"] or device["id"]
+                if result["error"]:
+                    print(f"FAILED {label}: {result['error']}", file=sys.stderr)
+                else:
+                    print(f"COLLECTED {label}: {len(result['interfaces'])} interface(s)")
 
-        ddc1_devices = [device for device in all_devices if is_ddc1_device(device)]
-        ddc1_switches = [device for device in ddc1_devices if is_switch(device)]
-
-        print(f"\nTotal unique devices returned: {len(all_devices)}")
-        print(f"DDC1 devices found: {len(ddc1_devices)}")
-        print(f"DDC1 switches found: {len(ddc1_switches)}")
-
-        if not ddc1_devices:
-            display_device_diagnostics(all_devices)
-        elif not ddc1_switches:
-            print("\nDDC1 devices were found, but none matched the switch filter.")
-            print("DDC1 device types and names:")
-            for device in ddc1_devices:
-                name = first_value(
-                    device,
-                    ("name", "deviceName", "hostName", "hostname"),
-                    "",
-                )
-                device_type = " ".join(flatten_strings(device)).strip()
-                print(f"  {name}: {device_type[:300]}")
-
-        rows: List[Dict[str, str]] = []
-        for device in ddc1_switches:
-            name = first_value(device, ("name", "hostName", "hostname"), "")
-            try:
-                interfaces = client.get_interfaces(
-                    device,
-                    args.interfaces_path_template,
-                    args.interfaces_method,
-                )
-                if not interfaces:
-                    print(f"{name}: no interfaces returned")
-                for interface in interfaces:
-                    rows.append(normalize_interface_row(device, interface))
-                print(f"{name}: {len(interfaces)} interfaces")
-            except Exception as error:
-                print(f"{name}: interface lookup failed: {error}")
-
+        rows = flatten_results(results)
         rows.sort(key=lambda row: (row["Device"].lower(), row["Interface"].lower()))
-        display_rows(rows)
         write_csv(rows, args.csv_file)
-        print(f"\nCSV report saved to: {args.csv_file}")
+        display_summary(rows, len(devices))
+        print(f"CSV report saved to: {args.csv_file}")
         return 0
-
-    except Exception as error:
-        print(f"NetBrain query failed: {error}", file=sys.stderr)
+    except Exception as exc:
+        print(f"NetBrain report failed: {exc}", file=sys.stderr)
         return 1
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    raise SystemExit(main())
