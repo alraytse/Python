@@ -7,6 +7,7 @@ API pages, and optionally collects interfaces for the resulting unique devices.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import csv
 import getpass
 import hashlib
@@ -47,10 +48,22 @@ class NetBrainClient:
             "Accept": "application/json",
             "Content-Type": "application/json",
         })
+        self._thread_sessions = {}
+
+    def _get_thread_session(self):
+        """Use one requests session per worker thread."""
+        import threading
+        thread_id = threading.get_ident()
+        if thread_id not in self._thread_sessions:
+            session = requests.Session()
+            session.verify = self.session.verify
+            session.headers.update(dict(self.session.headers))
+            self._thread_sessions[thread_id] = session
+        return self._thread_sessions[thread_id]
 
     def request(self, method: str, path: str, **kwargs: Any) -> Any:
         url = path if path.startswith(("http://", "https://")) else self.base_url + path
-        response = self.session.request(method, url, timeout=60, **kwargs)
+        response = self._get_thread_session().request(method, url, timeout=60, **kwargs)
         if not response.ok:
             body = response.text[:1500].replace("\n", " ")
             raise RuntimeError(f"HTTP {response.status_code} from {url}: {body}")
@@ -86,6 +99,7 @@ class NetBrainClient:
         max_pages: int = 500,
         page_param: str = "pageNo",
         page_size_param: str = "pageSize",
+        workers: int = 30,
     ) -> List[Any]:
         """Collect pages while deduplicating records and stopping repeated patterns."""
         raw_pages: List[Any] = []
@@ -138,20 +152,33 @@ class NetBrainClient:
                 continue
             seen_signatures.add(signature)
 
-            for offset in range(1, max_pages):
-                value = first_value + offset
-                try:
-                    page = self.request("GET", DEVICES_PATH, params=builder(value))
-                except Exception as error:
-                    print(f"Pagination stopped ({label}, value={value}): {error}")
-                    break
-                raw_pages.append(page)
-                page_count, new_count, signature = absorb(page, f"{label} value={value}")
-                if signature in seen_signatures or page_count == 0 or new_count == 0:
-                    break
-                seen_signatures.add(signature)
-                if page_count < page_size:
-                    break
+            def fetch_page(value: int):
+                return value, self.request("GET", DEVICES_PATH, params=builder(value))
+
+            stop = False
+            next_value = first_value + 1
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                for batch_start in range(next_value, first_value + max_pages, workers):
+                    batch_values = list(range(batch_start, min(batch_start + workers, first_value + max_pages)))
+                    futures = [executor.submit(fetch_page, value) for value in batch_values]
+                    batch_results = []
+                    for future in as_completed(futures):
+                        try:
+                            batch_results.append(future.result())
+                        except Exception as error:
+                            print(f"Pagination worker failed ({label}): {error}")
+                    for value, page in sorted(batch_results, key=lambda item: item[0]):
+                        raw_pages.append(page)
+                        page_count, new_count, signature = absorb(page, f"{label} value={value}")
+                        if signature in seen_signatures or page_count == 0 or new_count == 0:
+                            stop = True
+                            break
+                        seen_signatures.add(signature)
+                        if page_count < page_size:
+                            stop = True
+                            break
+                    if stop:
+                        break
 
         if first_count == page_size and len(seen_ids) <= page_size:
             print(
@@ -403,18 +430,29 @@ def write_raw_csv(path: Path, raw_pages: List[Any]) -> int:
     return len(rows)
 
 
-def collect_interfaces(client: NetBrainClient, devices: List[Dict[str, Any]], path_template: str) -> List[Dict[str, Any]]:
-    rows: List[Dict[str, Any]] = []
-    for index, device in enumerate(devices, 1):
+def collect_interfaces(
+    client: NetBrainClient,
+    devices: List[Dict[str, Any]],
+    path_template: str,
+    workers: int = 30,
+) -> List[Dict[str, Any]]:
+    def fetch_one(index: int, device: Dict[str, Any]):
         identity = device_identity(device)
         device_id_value = first_value(device, ("id", "deviceId", "deviceID", "uuid"), "")
         if not device_id_value:
-            print(f"Interface {index}/{len(devices)} skipped: {identity} has no device ID")
-            continue
-        path = path_template.format(device_id=device_id_value, id=device_id_value, name=device_name(device))
+            return index, [], f"Interface {index}/{len(devices)} skipped: {identity} has no device ID"
+        path = path_template.format(
+            device_id=device_id_value,
+            id=device_id_value,
+            name=device_name(device),
+        )
         try:
             response = client.request("GET", path)
-            interfaces = extract_records(response, ("interfaces", "ports", "interfaceList", "records", "items", "results", "data"))
+            interfaces = extract_records(
+                response,
+                ("interfaces", "ports", "interfaceList", "records", "items", "results", "data"),
+            )
+            rows = []
             for interface in interfaces:
                 if isinstance(interface, dict):
                     row = flatten_json(interface)
@@ -425,9 +463,20 @@ def collect_interfaces(client: NetBrainClient, devices: List[Dict[str, Any]], pa
                         "_site_match_status": site_match_status(device, DEFAULT_SITE_FILTER),
                     })
                     rows.append(row)
-            print(f"Interfaces {index}/{len(devices)}: {device_name(device) or device_id_value} -> {len(interfaces)}")
+            return index, rows, f"Interfaces {index}/{len(devices)}: {device_name(device) or device_id_value} -> {len(interfaces)}"
         except Exception as error:
-            print(f"Interface lookup failed for {device_name(device) or device_id_value}: {error}")
+            return index, [], f"Interface lookup failed for {device_name(device) or device_id_value}: {error}"
+
+    results = []
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(fetch_one, index, device) for index, device in enumerate(devices, 1)]
+        for future in as_completed(futures):
+            results.append(future.result())
+
+    rows: List[Dict[str, Any]] = []
+    for _, result_rows, message in sorted(results, key=lambda item: item[0]):
+        print(message)
+        rows.extend(result_rows)
     return rows
 
 
@@ -447,6 +496,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--inventory-csv-file", default="netbrain_device_inventory.csv")
     parser.add_argument("--page-size", type=int, default=50)
     parser.add_argument("--max-pages", type=int, default=500)
+    parser.add_argument("--workers", type=int, default=30, help="Concurrent API workers. Default: 30")
     parser.add_argument("--page-param", default="pageNo")
     parser.add_argument("--page-size-param", default="pageSize")
     parser.add_argument("--collect-interfaces", action="store_true")
@@ -457,8 +507,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main() -> int:
     args = build_parser().parse_args()
-    if args.page_size <= 0 or args.max_pages <= 0:
-        print("page-size and max-pages must be positive", file=sys.stderr)
+    if args.page_size <= 0 or args.max_pages <= 0 or args.workers <= 0:
+        print("page-size, max-pages, and workers must be positive", file=sys.stderr)
         return 2
 
     client: Optional[NetBrainClient] = None
@@ -482,6 +532,7 @@ def main() -> int:
                 max_pages=args.max_pages,
                 page_param=args.page_param,
                 page_size_param=args.page_size_param,
+                workers=args.workers,
             )
         except Exception as error:
             print(f"NetBrain collection failed: {error}", file=sys.stderr)
@@ -534,7 +585,7 @@ def main() -> int:
                     "mgmtIP": row.get("mgmtIP", ""),
                     "name": row.get("name", ""),
                 })
-            interface_rows = collect_interfaces(client, devices, args.interfaces_path_template)
+            interface_rows = collect_interfaces(client, devices, args.interfaces_path_template, args.workers)
             write_dict_csv(Path(args.interfaces_csv_file), interface_rows)
             print(f"Interface CSV: {args.interfaces_csv_file} ({len(interface_rows)} rows)")
 
