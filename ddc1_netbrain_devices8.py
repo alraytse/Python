@@ -36,6 +36,11 @@ DEFAULT_SITE_FILTER = "DDC1"
 LOGIN_PATH = "/ServicesAPI/API/V1/Session"
 DEVICES_PATH = "/ServicesAPI/API/V1/CMDB/Devices"
 DEFAULT_INTERFACES_PATH = "/ServicesAPI/API/V1/CMDB/Devices/{device_id}/Interfaces"
+INTERFACE_REPORT_FIELDS = [
+    "InterfaceName", "InterfaceType", "VRFName", "InterfaceDescription",
+    "AdminStatus", "OperStatus", "Speed", "VLAN", "IPAddress",
+    "_device_id", "_device_name", "_management_ip", "_site_match_status",
+]
 
 
 class NetBrainClient:
@@ -523,11 +528,15 @@ def deduplicate_devices(raw_pages: List[Any]) -> Tuple[List[Dict[str, Any]], Lis
     return inventory, audit
 
 
-def write_dict_csv(path: Path, rows: List[Dict[str, Any]]) -> None:
-    if not rows:
+def write_dict_csv(
+    path: Path,
+    rows: List[Dict[str, Any]],
+    field_order: Optional[List[str]] = None,
+) -> None:
+    fields: List[str] = list(field_order or [])
+    if not rows and not fields:
         path.write_text("", encoding="utf-8")
         return
-    fields: List[str] = []
     for row in rows:
         for field in row:
             if field not in fields:
@@ -628,7 +637,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--workers", type=int, default=30, help="Concurrent API workers. Default: 30")
     parser.add_argument("--page-param", default="pageNo")
     parser.add_argument("--page-size-param", default="pageSize")
-    parser.add_argument("--collect-interfaces", action="store_true")
+    interface_group = parser.add_mutually_exclusive_group()
+    interface_group.add_argument(
+        "--collect-interfaces",
+        dest="collect_interfaces",
+        action="store_true",
+        help="Collect interface records (default for live runs).",
+    )
+    interface_group.add_argument(
+        "--skip-interfaces",
+        dest="collect_interfaces",
+        action="store_false",
+        help="Skip interface collection.",
+    )
+    parser.set_defaults(collect_interfaces=True)
     parser.add_argument("--interfaces-csv-file", default="netbrain_interfaces_all_columns.csv")
     parser.add_argument("--interfaces-path-template", default=DEFAULT_INTERFACES_PATH)
     return parser
@@ -704,7 +726,15 @@ def main() -> int:
 
     if args.collect_interfaces:
         if client is None:
-            print("Interface collection requires live authentication; skipping offline mode.")
+            write_dict_csv(
+                Path(args.interfaces_csv_file),
+                [],
+                INTERFACE_REPORT_FIELDS,
+            )
+            print(
+                "Offline JSON has no interface records; created a header-only "
+                f"interface CSV: {args.interfaces_csv_file}"
+            )
         else:
             # Reconstruct minimal device dictionaries from the deduplicated rows.
             devices = []
@@ -715,7 +745,7 @@ def main() -> int:
                     "name": row.get("name", ""),
                 })
             interface_rows = collect_interfaces(client, devices, args.interfaces_path_template, args.workers)
-            write_dict_csv(Path(args.interfaces_csv_file), interface_rows)
+            write_dict_csv(Path(args.interfaces_csv_file), interface_rows, INTERFACE_REPORT_FIELDS)
             print(f"Interface CSV: {args.interfaces_csv_file} ({len(interface_rows)} rows)")
 
     return 0
