@@ -415,8 +415,6 @@ def interface_category(interface: Dict[str, Any]) -> str:
     """Classify an interface from its name and type, not from device metadata."""
     name = interface_name(interface).strip().casefold()
     kind = interface_type(interface).strip().casefold()
-    if not name and not kind:
-        return ""
 
     virtual_name_patterns = (
         r"^(vlan|svi)\d*([./].*)?$",
@@ -705,8 +703,6 @@ def interface_rows_for_device(
     management = management_ip(device)
     result = []
     for interface in interfaces:
-        if not isinstance(interface, dict) or not interface:
-            continue
         ips = extract_ip_addresses(interface)
         result.append({
             "Management IP": management,
@@ -735,6 +731,12 @@ def collect_offline_interfaces(raw_pages: List[Any], site_filter: str) -> List[D
         interfaces = [item for item in extract_records(device, INTERFACE_RECORD_KEYS) if isinstance(item, dict)]
         if interfaces:
             rows.extend(interface_rows_for_device(device, interfaces, site_filter))
+        else:
+            rows.extend(interface_rows_for_device(
+                device, [{}], site_filter,
+                collection_status="NO_INTERFACE_DATA",
+                collection_error="No embedded interface records were found in offline JSON",
+            ))
     return rows
 
 
@@ -799,7 +801,9 @@ def collect_interfaces(
         device_id_value = device_id(device)
         if not device_id_value:
             message = f"Interface {index}/{len(devices)} skipped: {identity} has no device ID"
-            return index, [], message
+            return index, interface_rows_for_device(
+                device, [{}], site_filter, "NO_DEVICE_ID", message
+            ), message
         path = format_interface_path(selected_path, device)
         try:
             response = client.request("GET", path)
@@ -809,13 +813,17 @@ def collect_interfaces(
             ]
             if not interfaces:
                 message = f"Interfaces {index}/{len(devices)}: {device_name(device) or device_id_value} -> 0"
-                return index, [], message
+                return index, interface_rows_for_device(
+                    device, [{}], site_filter, "NO_INTERFACE_DATA", message
+                ), message
             rows = interface_rows_for_device(device, interfaces, site_filter)
             message = f"Interfaces {index}/{len(devices)}: {device_name(device) or device_id_value} -> {len(interfaces)}"
             return index, rows, message
         except Exception as error:
             message = f"Interface lookup failed for {device_name(device) or device_id_value}: {error}"
-            return index, [], message
+            return index, interface_rows_for_device(
+                device, [{}], site_filter, "LOOKUP_FAILED", str(error)
+            ), message
 
     results = []
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -952,8 +960,6 @@ def main() -> int:
             interface_rows = collect_offline_interfaces(raw_pages, args.site_filter)
             write_dict_csv(Path(args.interfaces_csv_file), interface_rows, INTERFACE_REPORT_FIELDS)
             print(f"Offline interface CSV: {args.interfaces_csv_file} ({len(interface_rows)} rows)")
-            if not interface_rows:
-                print("WARNING: No embedded interface records were found; no placeholder rows were written.")
         else:
             devices = []
             for row in inventory:
@@ -973,8 +979,6 @@ def main() -> int:
             )
             write_dict_csv(Path(args.interfaces_csv_file), interface_rows, INTERFACE_REPORT_FIELDS)
             print(f"Interface CSV: {args.interfaces_csv_file} ({len(interface_rows)} rows)")
-            if not interface_rows:
-                print("WARNING: No interface records were collected; no placeholder rows were written.")
 
     return 0
 
