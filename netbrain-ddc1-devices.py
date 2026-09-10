@@ -1,38 +1,61 @@
-import requests
 import csv
-import sys
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 
-# Suppress SSL certificate verification warnings
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
-# --- Configuration Section ---
-BASE_URL = "https://netbrain.mckesson.com/ServicesAPI/API/V1"
-USERNAME = "skk30ws"
-PASSWORD = "m'A)=(nR0k{D#r0q6uEQy"
+# --- Configuration ---
+BASE_URL = os.getenv(
+    "NETBRAIN_HOST",
+    "https://netbrain.mckesson.com",
+).rstrip("/")
 
-# Explicitly targets your downloads folder
-OUTPUT_FILE = "/Users/alex.raytselsky/Downloads/ddc1_network_inventory.csv"
+API_PREFIX = f"{BASE_URL}/ServicesAPI/API/V1"
 
-# Concurrency tuning parameters
-MAX_WORKERS = 50   
-PAGE_LIMIT = 100    
-MAX_ESTIMATED_PAGES = 100  
+USERNAME = os.environ["NETBRAIN_USERNAME"]
+PASSWORD = os.environ["NETBRAIN_PASSWORD"]
 
-# List of default system VRF names to exclude from the report
-DEFAULT_VRFS = {"default", "mgmt", "management", "global", "none", "null", ""}
+OUTPUT_FILE = os.getenv(
+    "OUTPUT_FILE",
+    "/Users/alex.raytselsky/Downloads/ddc1_network_inventory.csv",
+)
 
-# 1. Authenticate with NetBrain
-login_url = f"{BASE_URL}/Session"
-login_payload = {"username": USERNAME, "password": PASSWORD}
+MAX_WORKERS = 50
+PAGE_LIMIT = 100
+MAX_ESTIMATED_PAGES = 100
 
-print("Logging into NetBrain (External Auth)...")
-response = requests.post(login_url, json=login_payload, verify=False)
+DEFAULT_VRFS = {
+    "default",
+    "mgmt",
+    "management",
+    "global",
+    "none",
+    "null",
+    "",
+}
+
+# --- Authenticate ---
+login_url = f"{API_PREFIX}/Session"
+login_payload = {
+    "username": USERNAME,
+    "password": PASSWORD,
+}
+
+print("Logging into NetBrain...")
+response = requests.post(
+    login_url,
+    json=login_payload,
+    verify=False,
+    timeout=30,
+)
 
 if response.status_code != 200:
-    raise Exception(f"Authentication failed ({response.status_code}): {response.text}")
+    raise Exception(
+        f"Authentication failed ({response.status_code}): {response.text}"
+    )
 
 login_data = response.json()
 token = login_data.get("token")
@@ -43,188 +66,350 @@ if not token:
 headers = {
     "Token": token,
     "Content-Type": "application/json",
-    "Accept": "application/json"
+    "Accept": "application/json",
 }
 
 if login_data.get("tenantId") and login_data.get("domainId"):
-    headers["tenantId"] = login_data.get("tenantId")
-    headers["domainId"] = login_data.get("domainId")
+    headers["tenantId"] = login_data["tenantId"]
+    headers["domainId"] = login_data["domainId"]
 
-
-# 2. Worker task to pull basic device records
 def fetch_device_page(skip_value):
-    url = f"{BASE_URL}/CMDB/Devices"
+    """Retrieve one page of device records."""
+    url = f"{API_PREFIX}/CMDB/Devices"
     query_params = {
         "skip": skip_value,
-        "limit": PAGE_LIMIT
+        "limit": PAGE_LIMIT,
     }
+
     try:
-        res = requests.get(url, headers=headers, params=query_params, verify=False, timeout=30)
-        if res.status_code == 200:
-            return res.json().get("devices", [])
-        return []
+        response = requests.get(
+            url,
+            headers=headers,
+            params=query_params,
+            verify=False,
+            timeout=30,
+        )
+
+        if response.status_code == 200:
+            return response.json().get("devices", [])
+
     except Exception:
-        return []
+        pass
 
+    return []
 
-# 3. Worker task to enrich devices with Interface, Production VRF, and Routing Protocols
 def enrich_device_metadata(device_id, hostname):
-    types = set()
+    """Retrieve interface types, VRFs, and routing protocols."""
+    interface_types = set()
     vrfs = set()
     protocols = set()
-    
-    query_params_id = {"deviceId": device_id} if device_id else {"hostname": str(hostname).lower()}
-    query_params_fallback = {"hostname": str(hostname).lower()}
-    
+
+    query_params_id = (
+        {"deviceId": device_id}
+        if device_id
+        else {"hostname": str(hostname).lower()}
+    )
+
+    query_params_fallback = {
+        "hostname": str(hostname).lower()
+    }
+
+    # Interfaces and VRFs
     try:
-        intf_url = f"{BASE_URL}/CMDB/Devices/Interfaces"
-        res_intf = requests.get(intf_url, headers=headers, params=query_params_id, verify=False, timeout=15)
-        
-        if res_intf.status_code != 200 or not res_intf.json().get("interfaces"):
-            res_intf = requests.get(intf_url, headers=headers, params=query_params_fallback, verify=False, timeout=15)
-            
-        if res_intf.status_code == 200:
-            interfaces = res_intf.json().get("interfaces", [])
-            for intf in interfaces:
-                if_type = intf.get("interfaceType") or intf.get("type") or intf.get("intfType")
-                if if_type:
-                    types.add(str(if_type))
-                    
-                vrf_name = intf.get("vrf") or intf.get("vrfName") or intf.get("vrf_name")
-                if vrf_name and str(vrf_name).strip().lower() not in DEFAULT_VRFS:
+        interfaces_url = f"{API_PREFIX}/CMDB/Devices/Interfaces"
+
+        response = requests.get(
+            interfaces_url,
+            headers=headers,
+            params=query_params_id,
+            verify=False,
+            timeout=15,
+        )
+
+        if (
+            response.status_code != 200
+            or not response.json().get("interfaces")
+        ):
+            response = requests.get(
+                interfaces_url,
+                headers=headers,
+                params=query_params_fallback,
+                verify=False,
+                timeout=15,
+            )
+
+        if response.status_code == 200:
+            interfaces = response.json().get("interfaces", [])
+
+            for interface in interfaces:
+                interface_type = (
+                    interface.get("interfaceType")
+                    or interface.get("type")
+                    or interface.get("intfType")
+                )
+
+                if interface_type:
+                    interface_types.add(str(interface_type))
+
+                vrf_name = (
+                    interface.get("vrf")
+                    or interface.get("vrfName")
+                    or interface.get("vrf_name")
+                )
+
+                if (
+                    vrf_name
+                    and str(vrf_name).strip().lower() not in DEFAULT_VRFS
+                ):
                     vrfs.add(str(vrf_name).strip())
+
     except Exception:
         pass
 
+    # Routing protocols
     try:
-        rt_url = f"{BASE_URL}/CMDB/Devices/Routing/Protocols"
-        res_rt = requests.get(rt_url, headers=headers, params=query_params_id, verify=False, timeout=15)
-        
-        if res_rt.status_code != 200 or not res_rt.json().get("protocols"):
-            res_rt = requests.get(rt_url, headers=headers, params=query_params_fallback, verify=False, timeout=15)
-            
-        if res_rt.status_code == 200:
-            proto_list = res_rt.json().get("protocols", [])
-            for proto in proto_list:
-                p_name = proto.get("protocolName") or proto.get("name") or proto.get("type")
-                if p_name:
-                    protocols.add(str(p_name).upper())
+        protocols_url = (
+            f"{API_PREFIX}/CMDB/Devices/Routing/Protocols"
+        )
+
+        response = requests.get(
+            protocols_url,
+            headers=headers,
+            params=query_params_id,
+            verify=False,
+            timeout=15,
+        )
+
+        if (
+            response.status_code != 200
+            or not response.json().get("protocols")
+        ):
+            response = requests.get(
+                protocols_url,
+                headers=headers,
+                params=query_params_fallback,
+                verify=False,
+                timeout=15,
+            )
+
+        if response.status_code == 200:
+            protocol_list = response.json().get("protocols", [])
+
+            for protocol in protocol_list:
+                protocol_name = (
+                    protocol.get("protocolName")
+                    or protocol.get("name")
+                    or protocol.get("type")
+                )
+
+                if protocol_name:
+                    protocols.add(str(protocol_name).upper())
+
     except Exception:
         pass
-                    
-    return list(types), list(vrfs), list(protocols)
 
+    return (
+        list(interface_types),
+        list(vrfs),
+        list(protocols),
+    )
 
-# 4. Thread Orchestration Pool - Phase 1: Global Device Collection
+# --- Phase 1: Collect DDC1 devices ---
 all_ddc1_devices = []
 seen_hostnames = set()
-all_discovered_columns = set()
+all_discovered_columns = {
+    "interfaceTypes",
+    "vrfNames",
+    "routingProtocols",
+}
 
-all_discovered_columns.update(["interfaceTypes", "vrfNames", "routingProtocols"])
+skip_offsets = [
+    index * PAGE_LIMIT
+    for index in range(MAX_ESTIMATED_PAGES)
+]
 
-skip_offsets = [i * PAGE_LIMIT for i in range(MAX_ESTIMATED_PAGES)]
-
-print(f"\nInitializing ThreadPoolExecutor with {MAX_WORKERS} workers...")
-print("Pulling inventory globally and compiling DDC1 device profiles...")
+print(f"Initializing {MAX_WORKERS} workers...")
+print("Pulling inventory and compiling DDC1 device profiles...")
 
 with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-    future_to_skip = {executor.submit(fetch_device_page, skip): skip for skip in skip_offsets}
-    
+    future_to_skip = {
+        executor.submit(fetch_device_page, skip): skip
+        for skip in skip_offsets
+    }
+
     for future in as_completed(future_to_skip):
         try:
             devices_batch = future.result()
-            if devices_batch:
-                for device in devices_batch:
-                    hostname = device.get("hostName") or device.get("hostname") or device.get("name")
-                    
-                    if hostname and hostname not in seen_hostnames:
-                        # CRITICAL FIX: Convert the entire string representation to uppercase 
-                        # to match 'DDC1' regardless of casing layout (e.g. 'ddc1', 'Ddc1')
-                        device_str = str(device).upper()
-                        
-                        if "DDC1" in device_str:
-                            seen_hostnames.add(hostname)
-                            flat_device = {}
-                            flat_device["_internal_processing_id"] = device.get("id") or device.get("deviceId")
-                            
-                            def is_excluded(field_name):
-                                name_lower = field_name.lower()
-                                return "id" in name_lower or "discovery" in name_lower or "time" in name_lower
 
-                            for key, value in device.items():
-                                if key == "attributes" and isinstance(value, dict):
-                                    for sub_key, sub_value in value.items():
-                                        if is_excluded(sub_key):
-                                            continue
-                                        flat_device[f"attr_{sub_key}"] = sub_value
-                                else:
-                                    if is_excluded(key):
-                                        continue
-                                    flat_device[key] = value
-                                    
-                            for flat_key in flat_device.keys():
-                                if flat_key != "_internal_processing_id":
-                                    all_discovered_columns.add(flat_key)
-                                
-                            all_ddc1_devices.append(flat_device)
+            for device in devices_batch:
+                hostname = (
+                    device.get("hostName")
+                    or device.get("hostname")
+                    or device.get("name")
+                )
+
+                if not hostname or hostname in seen_hostnames:
+                    continue
+
+                if "DDC1" not in str(device).upper():
+                    continue
+
+                seen_hostnames.add(hostname)
+
+                flat_device = {
+                    "_internal_processing_id": (
+                        device.get("id")
+                        or device.get("deviceId")
+                    )
+                }
+
+                def is_excluded(field_name):
+                    name_lower = field_name.lower()
+                    return (
+                        "id" in name_lower
+                        or "discovery" in name_lower
+                        or "time" in name_lower
+                    )
+
+                for key, value in device.items():
+                    if key == "attributes" and isinstance(value, dict):
+                        for sub_key, sub_value in value.items():
+                            if not is_excluded(sub_key):
+                                flat_device[f"attr_{sub_key}"] = sub_value
+                    elif not is_excluded(key):
+                        flat_device[key] = value
+
+                for column in flat_device:
+                    if column != "_internal_processing_id":
+                        all_discovered_columns.add(column)
+
+                all_ddc1_devices.append(flat_device)
+
         except Exception:
             pass
 
-print(f"\n[DEBUG LOG] Phase 1 finished. Found a total of {len(all_ddc1_devices)} unique DDC1 devices.")
+print(
+    f"Phase 1 finished. Found "
+    f"{len(all_ddc1_devices)} unique DDC1 devices."
+)
 
-# 5. Thread Orchestration Pool - Phase 2: Complete Data Enrichment Loop
+# --- Phase 2: Enrich device records ---
 if all_ddc1_devices:
-    print(f"Gathering interface types, production VRFs, and routing protocols for {len(all_ddc1_devices)} devices...")
-    
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as enrichment_executor:
+    print(
+        "Gathering interface types, production VRFs, "
+        "and routing protocols..."
+    )
+
+    with ThreadPoolExecutor(
+        max_workers=MAX_WORKERS
+    ) as executor:
         future_to_device = {}
-        for dev in all_ddc1_devices:
-            hname = dev.get("hostName") or dev.get("hostname") or dev.get("name")
-            device_id_context = dev.get("_internal_processing_id")
-            if hname:
-                f = enrichment_executor.submit(enrich_device_metadata, device_id_context, hname)
-                future_to_device[f] = dev
-        
+
+        for device in all_ddc1_devices:
+            hostname = (
+                device.get("hostName")
+                or device.get("hostname")
+                or device.get("name")
+            )
+
+            device_id = device.get("_internal_processing_id")
+
+            if hostname:
+                future = executor.submit(
+                    enrich_device_metadata,
+                    device_id,
+                    hostname,
+                )
+                future_to_device[future] = device
+
         for future in as_completed(future_to_device):
-            device_ref = future_to_device[future]
+            device = future_to_device[future]
+
             try:
-                unique_types, unique_vrfs, unique_protocols = future.result()
-                device_ref["interfaceTypes"] = ", ".join(sorted(unique_types)) if unique_types else "N/A"
-                device_ref["vrfNames"] = ", ".join(sorted(unique_vrfs)) if unique_vrfs else "None"
-                device_ref["routingProtocols"] = ", ".join(sorted(unique_protocols)) if unique_protocols else "None"
+                interface_types, vrfs, protocols = future.result()
+
+                device["interfaceTypes"] = (
+                    ", ".join(sorted(interface_types))
+                    if interface_types
+                    else "N/A"
+                )
+
+                device["vrfNames"] = (
+                    ", ".join(sorted(vrfs))
+                    if vrfs
+                    else "None"
+                )
+
+                device["routingProtocols"] = (
+                    ", ".join(sorted(protocols))
+                    if protocols
+                    else "None"
+                )
+
             except Exception:
-                device_ref["interfaceTypes"] = "Error"
-                device_ref["vrfNames"] = "Error"
-                device_ref["routingProtocols"] = "Error"
+                device["interfaceTypes"] = "Error"
+                device["vrfNames"] = "Error"
+                device["routingProtocols"] = "Error"
+
             finally:
-                device_ref.pop("_internal_processing_id", None)
+                device.pop("_internal_processing_id", None)
 
-# 6. Generate CSV Spreadsheet Layout (Bypassing early execution drops)
-print(f"\nProcessing compilation data...")
-
-# CRITICAL FIX: Even if 0 records match, write a fallback structured schema grid instead of killing execution
+# --- Generate CSV ---
 if not all_ddc1_devices:
-    all_ddc1_devices.append({
-        "hostName": "No Matching DDC1 Assets Discovered",
-        "mgmtIP": "Verify NetBrain Scope Casing",
-        "interfaceTypes": "N/A",
-        "vrfNames": "None",
-        "routingProtocols": "None"
-    })
-    all_discovered_columns.update(["hostName", "mgmtIP", "interfaceTypes", "vrfNames", "routingProtocols"])
+    all_ddc1_devices.append(
+        {
+            "hostName": "No Matching DDC1 Assets Discovered",
+            "mgmtIP": "Verify NetBrain Scope Casing",
+            "interfaceTypes": "N/A",
+            "vrfNames": "None",
+            "routingProtocols": "None",
+        }
+    )
 
-primary_headers = ["hostName", "hostname", "name", "mgmtIP", "mgmtIp", "managementIP", "interfaceTypes", "vrfNames", "routingProtocols"]
-sorted_all_columns = sorted(list(all_discovered_columns))
-dynamic_extra_headers = [col for col in sorted_all_columns if col not in primary_headers]
-ordered_headers = primary_headers + dynamic_extra_headers
+    all_discovered_columns.update(
+        {
+            "hostName",
+            "mgmtIP",
+            "interfaceTypes",
+            "vrfNames",
+            "routingProtocols",
+        }
+    )
 
-with open(OUTPUT_FILE, mode="w", newline="", encoding="utf-8") as csv_file:
-    writer = csv.DictWriter(csv_file, fieldnames=ordered_headers)
+primary_headers = [
+    "hostName",
+    "hostname",
+    "name",
+    "mgmtIP",
+    "mgmtIp",
+    "managementIP",
+    "interfaceTypes",
+    "vrfNames",
+    "routingProtocols",
+]
+
+dynamic_headers = [
+    column
+    for column in sorted(all_discovered_columns)
+    if column not in primary_headers
+]
+
+ordered_headers = primary_headers + dynamic_headers
+
+with open(
+    OUTPUT_FILE,
+    mode="w",
+    newline="",
+    encoding="utf-8",
+) as csv_file:
+    writer = csv.DictWriter(
+        csv_file,
+        fieldnames=ordered_headers,
+        extrasaction="ignore",
+    )
+
     writer.writeheader()
-    for ddc1_device in all_ddc1_devices:
-        writer.writerow(ddc1_device)
+    writer.writerows(all_ddc1_devices)
 
-print(f"✅ Success! File generation routine complete: {OUTPUT_FILE}")
-
-# 7. Gracefully terminate session
-print("\nLogging out...")
+print(f"Success! CSV generated at: {OUTPUT_FILE}")
+print("Logging out...")
