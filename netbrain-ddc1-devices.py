@@ -1,5 +1,5 @@
 import csv
-import os
+import getpass
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
@@ -8,19 +8,11 @@ from requests.packages.urllib3.exceptions import InsecureRequestWarning
 requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 
 # --- Configuration ---
-BASE_URL = os.getenv(
-    "NETBRAIN_HOST",
-    "https://netbrain.mckesson.com",
-).rstrip("/")
-
+BASE_URL = "https://netbrain.mckesson.com"
 API_PREFIX = f"{BASE_URL}/ServicesAPI/API/V1"
 
-USERNAME = os.environ["NETBRAIN_USERNAME"]
-PASSWORD = os.environ["NETBRAIN_PASSWORD"]
-
-OUTPUT_FILE = os.getenv(
-    "OUTPUT_FILE",
-    "/Users/alex.raytselsky/Downloads/ddc1_network_inventory.csv",
+OUTPUT_FILE = (
+    "/Users/alex.raytselsky/Downloads/ddc1_network_inventory.csv"
 )
 
 MAX_WORKERS = 50
@@ -37,6 +29,13 @@ DEFAULT_VRFS = {
     "",
 }
 
+# --- Prompt for credentials ---
+USERNAME = input("NetBrain username: ").strip()
+PASSWORD = getpass.getpass("NetBrain password: ")
+
+if not USERNAME or not PASSWORD:
+    raise ValueError("Username and password are required.")
+
 # --- Authenticate ---
 login_url = f"{API_PREFIX}/Session"
 login_payload = {
@@ -45,6 +44,7 @@ login_payload = {
 }
 
 print("Logging into NetBrain...")
+
 response = requests.post(
     login_url,
     json=login_payload,
@@ -74,7 +74,6 @@ if login_data.get("tenantId") and login_data.get("domainId"):
     headers["domainId"] = login_data["domainId"]
 
 def fetch_device_page(skip_value):
-    """Retrieve one page of device records."""
     url = f"{API_PREFIX}/CMDB/Devices"
     query_params = {
         "skip": skip_value,
@@ -99,7 +98,6 @@ def fetch_device_page(skip_value):
     return []
 
 def enrich_device_metadata(device_id, hostname):
-    """Retrieve interface types, VRFs, and routing protocols."""
     interface_types = set()
     vrfs = set()
     protocols = set()
@@ -114,7 +112,6 @@ def enrich_device_metadata(device_id, hostname):
         "hostname": str(hostname).lower()
     }
 
-    # Interfaces and VRFs
     try:
         interfaces_url = f"{API_PREFIX}/CMDB/Devices/Interfaces"
 
@@ -139,9 +136,7 @@ def enrich_device_metadata(device_id, hostname):
             )
 
         if response.status_code == 200:
-            interfaces = response.json().get("interfaces", [])
-
-            for interface in interfaces:
+            for interface in response.json().get("interfaces", []):
                 interface_type = (
                     interface.get("interfaceType")
                     or interface.get("type")
@@ -166,7 +161,6 @@ def enrich_device_metadata(device_id, hostname):
     except Exception:
         pass
 
-    # Routing protocols
     try:
         protocols_url = (
             f"{API_PREFIX}/CMDB/Devices/Routing/Protocols"
@@ -193,9 +187,7 @@ def enrich_device_metadata(device_id, hostname):
             )
 
         if response.status_code == 200:
-            protocol_list = response.json().get("protocols", [])
-
-            for protocol in protocol_list:
+            for protocol in response.json().get("protocols", []):
                 protocol_name = (
                     protocol.get("protocolName")
                     or protocol.get("name")
@@ -208,11 +200,7 @@ def enrich_device_metadata(device_id, hostname):
     except Exception:
         pass
 
-    return (
-        list(interface_types),
-        list(vrfs),
-        list(protocols),
-    )
+    return list(interface_types), list(vrfs), list(protocols)
 
 # --- Phase 1: Collect DDC1 devices ---
 all_ddc1_devices = []
@@ -293,16 +281,11 @@ print(
     f"{len(all_ddc1_devices)} unique DDC1 devices."
 )
 
-# --- Phase 2: Enrich device records ---
+# --- Phase 2: Enrich devices ---
 if all_ddc1_devices:
-    print(
-        "Gathering interface types, production VRFs, "
-        "and routing protocols..."
-    )
+    print("Gathering interface types, VRFs, and routing protocols...")
 
-    with ThreadPoolExecutor(
-        max_workers=MAX_WORKERS
-    ) as executor:
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         future_to_device = {}
 
         for device in all_ddc1_devices:
@@ -413,3 +396,4 @@ with open(
 
 print(f"Success! CSV generated at: {OUTPUT_FILE}")
 print("Logging out...")
+
