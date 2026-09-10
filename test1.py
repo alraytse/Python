@@ -11,7 +11,7 @@ requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
 # --- Configuration Section ---
 BASE_URL = "https://netbrain.mckesson.com/ServicesAPI/API/V1"
 USERNAME = "skk30ws"
-PASSWORD = "m'A)=(nR0k{D#r0q6uEQy"
+PASSWORD = "c@2OpW@PUDZy%aW;ROShF"
 
 OUTPUT_FILE = "/Users/alex.raytselsky/Downloads/ddc1_network_inventory.csv"
 
