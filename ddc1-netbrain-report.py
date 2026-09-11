@@ -77,16 +77,45 @@ def extract_interface_type(intf_name: str) -> str:
     return ""
 
 
+def extract_site_from_device(device: dict) -> str:
+    for key in ["siteName", "site", "sitePath", "location", "site_name"]:
+        val = device.get(key)
+        if val and isinstance(val, str) and val.strip():
+            return val.strip()
+
+    hostname = device.get("name") or device.get("hostName") or device.get("hostname") or ""
+    if hostname:
+        parts = hostname.split("-")
+        if parts:
+            return parts[0].strip()
+
+    return "DDC1"
+
+
 def fetch_single_interface_attr(hostname: str, intf_name: str) -> tuple:
     url = f"{BASE_URL}/CMDB/Interfaces/Attributes"
     try:
         r = session.get(url, params={"hostname": hostname, "interfaceName": intf_name}, timeout=10)
         if r.status_code == 200:
             attrs = r.json().get("attributes", {}).get(intf_name, {})
-            
+
             # Extract VRF
             vrf = attrs.get("mplsVrf", "").strip()
-            
+
+            # Check NAT & PAT attributes
+            nat_val = (
+                attrs.get("isNatIntf")
+                or attrs.get("natType")
+                or attrs.get("nat")
+                or attrs.get("natMode")
+            )
+            pat_val = (
+                attrs.get("isPatIntf")
+                or attrs.get("patType")
+                or attrs.get("pat")
+                or attrs.get("patMode")
+            )
+
             # Extract IPs
             found_ips = []
             ips_raw = attrs.get("ips")
@@ -98,50 +127,60 @@ def fetch_single_interface_attr(hostname: str, intf_name: str) -> tuple:
                         found_ips.append(item.strip())
             elif isinstance(ips_raw, str) and ips_raw.strip():
                 found_ips.append(ips_raw.strip())
-                
-            return vrf, found_ips
+
+            has_nat = bool(nat_val and str(nat_val).lower() not in ["false", "0", "disabled", "no", ""])
+            has_pat = bool(pat_val and str(pat_val).lower() not in ["false", "0", "disabled", "no", ""])
+
+            return vrf, found_ips, has_nat, has_pat
     except requests.RequestException:
         pass
-    return "", []
+    return "", [], False, False
 
 
 def enrich_device_metadata(hostname: str) -> tuple:
     types, vrfs, ip_addrs = set(), set(), set()
+    nat_interfaces, pat_interfaces = set(), set()
 
     if not hostname:
-        return ["N/A"], ["default"], ["N/A"]
+        return ["N/A"], ["default"], ["N/A"], "No", "No"
 
-    # 1. Fetch Interface Names
     url = f"{BASE_URL}/CMDB/Interfaces"
     try:
         r = session.get(url, params={"hostname": hostname}, timeout=15)
         if r.status_code == 200:
             intf_names = r.json().get("interfaces", [])
-            
-            # Extract Interface Types from naming prefix
+
             for intf in intf_names:
                 if_type = extract_interface_type(intf)
                 if if_type:
                     types.add(if_type)
 
-            # Fetch attributes for interfaces concurrently
             with ThreadPoolExecutor(max_workers=10) as executor:
                 futures = {
                     executor.submit(fetch_single_interface_attr, hostname, intf): intf
                     for intf in intf_names
                 }
                 for future in as_completed(futures):
-                    vrf, ips = future.result()
+                    intf_name = futures[future]
+                    vrf, ips, has_nat, has_pat = future.result()
+
                     if vrf and vrf.lower() not in ["none", "null", "undefined", "n/a", "0"]:
                         vrfs.add(vrf)
                     for ip in ips:
                         ip_addrs.add(ip)
+                    if has_nat:
+                        nat_interfaces.add(intf_name)
+                    if has_pat:
+                        pat_interfaces.add(intf_name)
 
     except requests.RequestException:
         pass
 
     valid_vrfs = sorted(list(vrfs)) if vrfs else ["default"]
-    return list(types), valid_vrfs, list(ip_addrs)
+    nat_summary = "\n".join(sorted(nat_interfaces)) if nat_interfaces else "No"
+    pat_summary = "\n".join(sorted(pat_interfaces)) if pat_interfaces else "No"
+
+    return list(types), valid_vrfs, list(ip_addrs), nat_summary, pat_summary
 
 
 def main():
@@ -150,9 +189,12 @@ def main():
     all_ddc1_devices = []
     seen_hostnames = set()
     all_discovered_columns = {
+        "requestedSite",
         "interfaceTypes",
         "vrfNames",
         "interfaceIPs",
+        "hasNAT",
+        "hasPAT",
     }
     skip_offsets = [i * PAGE_LIMIT for i in range(MAX_ESTIMATED_PAGES)]
     EXCLUDED_FIELDS = {"hostName", "hostname", "mgmtIP"}
@@ -180,6 +222,7 @@ def main():
                     if "DDC1" in searchable_fields:
                         seen_hostnames.add(hostname)
                         flat_device = {"_raw_device": device}
+                        flat_device["requestedSite"] = extract_site_from_device(device)
 
                         for k, v in device.items():
                             if k in EXCLUDED_FIELDS or any(
@@ -200,7 +243,7 @@ def main():
                         )
                         all_ddc1_devices.append(flat_device)
 
-    print(f"Found {len(all_ddc1_devices)} DDC1 assets. Enriching interface & VRF metadata...")
+    print(f"Found {len(all_ddc1_devices)} DDC1 assets. Enriching metadata...")
 
     if all_ddc1_devices:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
@@ -215,14 +258,18 @@ def main():
             for future in as_completed(future_map):
                 dev = future_map[future]
                 try:
-                    types, vrfs, ips = future.result()
-                    dev["interfaceTypes"] = ", ".join(sorted(types)) if types else "N/A"
-                    dev["vrfNames"] = ", ".join(vrfs)
-                    dev["interfaceIPs"] = ", ".join(sorted(ips)) if ips else "N/A"
+                    types, vrfs, ips, nat_res, pat_res = future.result()
+                    dev["interfaceTypes"] = "\n".join(sorted(types)) if types else "N/A"
+                    dev["vrfNames"] = "\n".join(vrfs)
+                    dev["interfaceIPs"] = "\n".join(sorted(ips)) if ips else "N/A"
+                    dev["hasNAT"] = nat_res
+                    dev["hasPAT"] = pat_res
                 except Exception:
                     dev["interfaceTypes"] = "N/A"
                     dev["vrfNames"] = "default"
                     dev["interfaceIPs"] = "N/A"
+                    dev["hasNAT"] = "No"
+                    dev["hasPAT"] = "No"
                 finally:
                     dev.pop("_raw_device", None)
 
@@ -230,13 +277,16 @@ def main():
         all_ddc1_devices.append(
             {
                 "name": "No Matching DDC1 Assets Discovered",
+                "requestedSite": "DDC1",
                 "interfaceIPs": "N/A",
                 "interfaceTypes": "N/A",
                 "vrfNames": "default",
+                "hasNAT": "No",
+                "hasPAT": "No",
             }
         )
 
-    primary_headers = ["name", "interfaceIPs", "interfaceTypes", "vrfNames"]
+    primary_headers = ["name", "requestedSite", "interfaceIPs", "interfaceTypes", "vrfNames", "hasNAT", "hasPAT"]
     extra_headers = sorted(
         [
             col
